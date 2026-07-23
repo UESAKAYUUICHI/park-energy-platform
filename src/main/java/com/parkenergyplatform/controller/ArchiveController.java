@@ -51,6 +51,12 @@ public class ArchiveController {
         return ApiResponse.success(queryService.deviceProfile(deviceId));
     }
 
+    @GetMapping("/devices/{deviceId}/archive-profile")
+    @SaCheckPermission("archive:list")
+    public ApiResponse<Map<String, Object>> deviceArchiveProfile(@PathVariable long deviceId) {
+        return ApiResponse.success(queryService.deviceArchiveProfile(deviceId));
+    }
+
     @GetMapping("/device-types/{typeId}/points")
     @SaCheckPermission("archive:list")
     public ApiResponse<Map<String, Object>> deviceTypePoints(@PathVariable long typeId) {
