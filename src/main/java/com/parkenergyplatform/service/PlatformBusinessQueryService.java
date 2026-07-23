@@ -148,6 +148,35 @@ public class PlatformBusinessQueryService {
         return profile;
     }
 
+    public Map<String, Object> deviceArchiveProfile(long deviceId) {
+        Map<String, Object> profile = deviceProfile(deviceId);
+        Map<String, Object> device = castMap(profile.get("device"));
+        Long orgId = longOrNull(device.get("org_id"));
+        profile.put("recentHistory", jdbcTemplate.queryForList("""
+                SELECT id, device_id, device_type_id, org_id, point_code, stat_date,
+                       start_value, end_value, usage_value, max_value, min_value, avg_value, data_complete_rate
+                FROM stats_daily_point
+                WHERE device_id = ?
+                ORDER BY stat_date DESC, point_code
+                LIMIT 12
+                """, deviceId));
+        profile.put("recentAlarms", jdbcTemplate.queryForList("""
+                SELECT id, rule_id, device_id, org_id, alarm_type, alarm_level, point_code,
+                       alarm_value, threshold_value, alarm_time, deal_status, deal_time, deal_user, deal_remark
+                FROM log_alarm
+                WHERE device_id = ?
+                ORDER BY alarm_time DESC
+                LIMIT 8
+                """, deviceId));
+        Map<String, String> trendParams = new LinkedHashMap<>();
+        trendParams.put("deviceId", String.valueOf(deviceId));
+        if (orgId != null) {
+            trendParams.put("orgId", String.valueOf(orgId));
+        }
+        profile.put("energyTrend", energyTrend(trendParams));
+        return profile;
+    }
+
     public Map<String, Object> deviceTypePoints(long typeId) {
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("deviceType", singleOrNull("SELECT * FROM dev_device_type WHERE id = ?", typeId));
@@ -561,6 +590,11 @@ public class PlatformBusinessQueryService {
     @SuppressWarnings("unchecked")
     private List<Map<String, Object>> children(Map<String, Object> node) {
         return (List<Map<String, Object>>) node.get("children");
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> castMap(Object value) {
+        return value instanceof Map<?, ?> map ? (Map<String, Object>) map : Map.of();
     }
 
     private String scopeSql(String column, List<Object> args) {

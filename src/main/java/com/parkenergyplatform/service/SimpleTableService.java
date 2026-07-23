@@ -120,7 +120,33 @@ public class SimpleTableService {
     public void delete(String resource, long id) {
         TableDefinition definition = tableRegistry.get(resource);
         get(resource, id);
+        assertDeleteChain(resource, id);
         jdbcTemplate.update("DELETE FROM " + definition.table() + " WHERE id = ?", id);
+    }
+
+    private void assertDeleteChain(String resource, long id) {
+        switch (resource) {
+            case "orgs" -> {
+                if (count("SELECT COUNT(*) FROM dev_org WHERE parent_id = ?", id) > 0) {
+                    throw new BusinessException("该组织下存在子组织，请先删除子组织");
+                }
+                if (count("SELECT COUNT(*) FROM dev_gateway WHERE org_id = ?", id) > 0) {
+                    throw new BusinessException("该组织下存在网关，请先删除网关");
+                }
+            }
+            case "gateways" -> {
+                if (count("SELECT COUNT(*) FROM dev_device WHERE gateway_id = ?", id) > 0) {
+                    throw new BusinessException("该网关下存在设备，请先删除设备");
+                }
+            }
+            default -> {
+            }
+        }
+    }
+
+    private long count(String sql, long id) {
+        Long value = jdbcTemplate.queryForObject(sql, Long.class, id);
+        return value == null ? 0L : value;
     }
 
     private String appendDataScope(TableDefinition definition, String where, List<Object> args) {

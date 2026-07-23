@@ -86,6 +86,12 @@ public class RbacController {
         return ApiResponse.success(rbacService.userOrgScopes(id));
     }
 
+    @GetMapping("/org-tree")
+    @SaCheckPermission("system:user:scope:list")
+    public ApiResponse<List<Map<String, Object>>> orgTreeForScopeBinding() {
+        return ApiResponse.success(rbacService.orgTreeForScopeBinding());
+    }
+
     @PutMapping("/users/{id}/org-scopes")
     @SaCheckPermission("system:user:scope:edit")
     @OperationLog(module = "权限管理", operation = "分配用户组织范围")

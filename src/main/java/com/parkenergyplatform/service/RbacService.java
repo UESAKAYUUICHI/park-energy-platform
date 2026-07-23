@@ -4,11 +4,14 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 import cn.dev33.satoken.stp.StpUtil;
+import cn.dev33.satoken.SaManager;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.parkenergyplatform.common.BusinessException;
@@ -28,6 +31,7 @@ import com.parkenergyplatform.mapper.SysRoleMapper;
 import com.parkenergyplatform.mapper.SysRolePermissionMapper;
 import com.parkenergyplatform.mapper.SysUserMapper;
 import com.parkenergyplatform.mapper.SysUserRoleMapper;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -41,17 +45,19 @@ public class RbacService {
     private final SysUserRoleMapper userRoleMapper;
     private final SysRolePermissionMapper rolePermissionMapper;
     private final DataScopeService dataScopeService;
+    private final JdbcTemplate jdbcTemplate;
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     public RbacService(SysUserMapper userMapper, SysRoleMapper roleMapper, SysPermissionMapper permissionMapper,
                        SysUserRoleMapper userRoleMapper, SysRolePermissionMapper rolePermissionMapper,
-                       DataScopeService dataScopeService) {
+                       DataScopeService dataScopeService, JdbcTemplate jdbcTemplate) {
         this.userMapper = userMapper;
         this.roleMapper = roleMapper;
         this.permissionMapper = permissionMapper;
         this.userRoleMapper = userRoleMapper;
         this.rolePermissionMapper = rolePermissionMapper;
         this.dataScopeService = dataScopeService;
+        this.jdbcTemplate = jdbcTemplate;
     }
 
     public Map<String, Object> login(LoginRequest request) {
@@ -252,10 +258,34 @@ public class RbacService {
         dataScopeService.replaceUserOrgScopes(userId, request == null ? List.of() : request.scopes());
     }
 
+    public List<Map<String, Object>> orgTreeForScopeBinding() {
+        Set<Long> visibleOrgIds = StpUtil.isLogin() ? dataScopeService.visibleOrgIds(StpUtil.getLoginIdAsLong()) : Set.of();
+        List<Map<String, Object>> rows;
+        if (visibleOrgIds == null) {
+            rows = jdbcTemplate.queryForList("""
+                    SELECT id, parent_id, org_name, org_type, leader, phone, address, sort
+                    FROM dev_org
+                    ORDER BY parent_id, sort, id
+                    """);
+        } else if (visibleOrgIds.isEmpty()) {
+            rows = List.of();
+        } else {
+            String placeholders = String.join(",", java.util.Collections.nCopies(visibleOrgIds.size(), "?"));
+            rows = jdbcTemplate.queryForList("""
+                    SELECT id, parent_id, org_name, org_type, leader, phone, address, sort
+                    FROM dev_org
+                    WHERE id IN (%s)
+                    ORDER BY parent_id, sort, id
+                    """.formatted(placeholders), visibleOrgIds.toArray());
+        }
+        return tree(rows);
+    }
+
     private Map<String, Object> sessionPayload(SysUser user) {
         user.setPassword(null);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("tokenName", StpUtil.getTokenName());
+        data.put("tokenPrefix", SaManager.getConfig().getTokenPrefix());
         data.put("tokenValue", StpUtil.getTokenValue());
         data.put("user", user);
         data.put("roles", roleCodes(user.getId()));
@@ -296,6 +326,27 @@ public class RbacService {
             }
         }
         return roots;
+    }
+
+    private List<Map<String, Object>> tree(List<Map<String, Object>> rows) {
+        Map<String, Map<String, Object>> byId = new LinkedHashMap<>();
+        for (Map<String, Object> source : rows) {
+            Map<String, Object> row = new LinkedHashMap<>(source);
+            row.put("children", new ArrayList<Map<String, Object>>());
+            byId.put(Objects.toString(row.get("id")), row);
+        }
+        Set<String> childIds = new LinkedHashSet<>();
+        for (Map<String, Object> row : byId.values()) {
+            String parentId = Objects.toString(row.get("parent_id"), "0");
+            Map<String, Object> parent = byId.get(parentId);
+            if (parent != null) {
+                @SuppressWarnings("unchecked")
+                List<Map<String, Object>> children = (List<Map<String, Object>>) parent.get("children");
+                children.add(row);
+                childIds.add(Objects.toString(row.get("id")));
+            }
+        }
+        return byId.values().stream().filter(row -> !childIds.contains(Objects.toString(row.get("id")))).toList();
     }
 
     private SysUser requireUser(Long id) {
