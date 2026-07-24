@@ -41,8 +41,14 @@ public class ArchiveController {
 
     @GetMapping("/device-tree")
     @SaCheckPermission("archive:list")
-    public ApiResponse<Object> deviceTree() {
-        return ApiResponse.success(queryService.deviceTree());
+    public ApiResponse<Object> deviceTree(HttpServletRequest request) {
+        return ApiResponse.success(queryService.deviceTree(queryParams(request)));
+    }
+
+    @GetMapping("/root-orgs")
+    @SaCheckPermission("archive:list")
+    public ApiResponse<Object> rootOrgs() {
+        return ApiResponse.success(queryService.rootOrgs());
     }
 
     @GetMapping("/devices/{deviceId}/profile")
@@ -55,6 +61,18 @@ public class ArchiveController {
     @SaCheckPermission("archive:list")
     public ApiResponse<Map<String, Object>> deviceArchiveProfile(@PathVariable long deviceId) {
         return ApiResponse.success(queryService.deviceArchiveProfile(deviceId));
+    }
+
+    @GetMapping("/orgs/{orgId}/archive-profile")
+    @SaCheckPermission("archive:list")
+    public ApiResponse<Map<String, Object>> orgArchiveProfile(@PathVariable long orgId) {
+        return ApiResponse.success(queryService.orgArchiveProfile(orgId));
+    }
+
+    @GetMapping("/gateways/{gatewayId}/archive-profile")
+    @SaCheckPermission("archive:list")
+    public ApiResponse<Map<String, Object>> gatewayArchiveProfile(@PathVariable long gatewayId) {
+        return ApiResponse.success(queryService.gatewayArchiveProfile(gatewayId));
     }
 
     @GetMapping("/device-types/{typeId}/points")
@@ -111,6 +129,13 @@ public class ArchiveController {
     public ApiResponse<Void> delete(@PathVariable String resource, @PathVariable long id) {
         tableService.delete(resource, id);
         return ApiResponse.success(null);
+    }
+
+    @PostMapping("/{resource}/{id}/copy")
+    @SaCheckPermission("archive:add")
+    @OperationLog(module = "档案管理", operation = "复制档案")
+    public ApiResponse<Map<String, Object>> copy(@PathVariable String resource, @PathVariable long id) {
+        return ApiResponse.success(tableService.copy(resource, id));
     }
 
     private Map<String, String> queryParams(HttpServletRequest request) {

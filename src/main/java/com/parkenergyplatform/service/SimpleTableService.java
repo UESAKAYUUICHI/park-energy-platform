@@ -124,6 +124,27 @@ public class SimpleTableService {
         jdbcTemplate.update("DELETE FROM " + definition.table() + " WHERE id = ?", id);
     }
 
+    @Transactional
+    public Map<String, Object> copy(String resource, long id) {
+        TableDefinition definition = tableRegistry.get(resource);
+        if (!Set.of("orgs", "gateways", "devices").contains(resource)) {
+            throw new BusinessException(400, "当前资源不支持复制");
+        }
+        Map<String, Object> current = get(resource, id);
+        Map<String, Object> values = writableValues(definition, current, false);
+        if ("gateways".equals(resource)) {
+            values.put("gateway_sn", uniqueCopyCode(Objects.toString(current.get("gateway_sn"), "GW"), id));
+        } else if ("devices".equals(resource)) {
+            values.put("device_sn", uniqueCopyCode(Objects.toString(current.get("device_sn"), "DEV"), id));
+        }
+        return create(resource, values);
+    }
+
+    private String uniqueCopyCode(String base, long id) {
+        String cleaned = base == null ? "" : base.trim();
+        return cleaned + "-COPY-" + id + "-" + Long.toString(System.currentTimeMillis(), 36).toUpperCase(Locale.ROOT);
+    }
+
     private void assertDeleteChain(String resource, long id) {
         switch (resource) {
             case "orgs" -> {
