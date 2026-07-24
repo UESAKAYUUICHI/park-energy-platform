@@ -49,7 +49,20 @@ public class PlatformBusinessQueryService {
         return tree(rows, "id", "parent_id", "children");
     }
 
-    public List<Map<String, Object>> deviceTree() {
+    public List<Map<String, Object>> rootOrgs() {
+        List<Object> args = new ArrayList<>();
+        return jdbcTemplate.queryForList("""
+                SELECT id, parent_id, org_name, org_type, sort
+                FROM dev_org
+                WHERE parent_id = 0
+                """ + scopeSql("id", args) + """
+                ORDER BY sort, id
+                """, args.toArray());
+    }
+
+    public List<Map<String, Object>> deviceTree(Map<String, String> params) {
+        Long rootOrgId = longOrNull(params.get("rootOrgId"));
+        String keyword = Objects.toString(params.get("keyword"), "").trim();
         List<Object> orgArgs = new ArrayList<>();
         List<Map<String, Object>> orgs = jdbcTemplate.queryForList("""
                 SELECT id, parent_id, org_name, org_type, sort
@@ -74,6 +87,9 @@ public class PlatformBusinessQueryService {
             } else {
                 children(parent).add(node);
             }
+        }
+        if (rootOrgId != null && rootOrgId > 0 && orgNodes.containsKey(rootOrgId)) {
+            roots = List.of(orgNodes.get(rootOrgId));
         }
 
         List<Object> gatewayArgs = new ArrayList<>();
@@ -120,7 +136,7 @@ public class PlatformBusinessQueryService {
                 }
             }
         }
-        return roots;
+        return pruneTree(roots, keyword);
     }
 
     public Map<String, Object> deviceProfile(long deviceId) {
@@ -168,12 +184,61 @@ public class PlatformBusinessQueryService {
                 ORDER BY alarm_time DESC
                 LIMIT 8
                 """, deviceId));
+        profile.put("inspectionRecords", jdbcTemplate.queryForList("""
+                SELECT id, command_id, gateway_id, target_type, target_id, target_sn, command_type,
+                       status, request_time, send_time, response_time, fail_reason, create_time
+                FROM command_record
+                WHERE target_type = 'DEVICE' AND target_id = ?
+                ORDER BY request_time DESC
+                LIMIT 8
+                """, deviceId));
         Map<String, String> trendParams = new LinkedHashMap<>();
         trendParams.put("deviceId", String.valueOf(deviceId));
         if (orgId != null) {
             trendParams.put("orgId", String.valueOf(orgId));
         }
         profile.put("energyTrend", energyTrend(trendParams));
+        return profile;
+    }
+
+    public Map<String, Object> orgArchiveProfile(long orgId) {
+        if (!accessService.hasOrgAccess(orgId)) {
+            throw new BusinessException(403, "没有该组织的数据访问权限");
+        }
+        Map<String, Object> profile = new LinkedHashMap<>();
+        profile.put("org", single("SELECT * FROM dev_org WHERE id = ?", orgId));
+        profile.put("deviceCount", countDevicesByOrg(orgId));
+        profile.put("gatewayCount", countGatewaysByOrg(orgId));
+        List<Object> onlineGatewayArgs = new ArrayList<>();
+        String onlineGatewayScope = accessService.orgFilterSql("org_id", orgId, true, onlineGatewayArgs);
+        profile.put("onlineGatewayCount", queryLong("""
+                SELECT COUNT(*)
+                FROM dev_gateway
+                WHERE online_status = 1
+                """ + onlineGatewayScope, onlineGatewayArgs));
+        profile.put("recentAlarms", orgAlarms(orgId));
+        profile.put("alarmTrend", orgAlarmTrend(orgId));
+        profile.put("energyTrend", energyTrend(Map.of("orgId", String.valueOf(orgId))));
+        profile.put("realtimeSnapshots", realtimeSnapshots(Map.of("orgId", String.valueOf(orgId))));
+        return profile;
+    }
+
+    public Map<String, Object> gatewayArchiveProfile(long gatewayId) {
+        accessService.assertGatewayAccess(gatewayId);
+        Map<String, Object> gateway = single("""
+                SELECT g.*, o.org_name
+                FROM dev_gateway g
+                LEFT JOIN dev_org o ON o.id = g.org_id
+                WHERE g.id = ?
+                """, gatewayId);
+        Map<String, Object> profile = new LinkedHashMap<>();
+        profile.put("gateway", gateway);
+        profile.put("deviceCount", queryLong("SELECT COUNT(*) FROM dev_device WHERE gateway_id = ?", List.of(gatewayId)));
+        profile.put("onlineDeviceCount", queryLong("SELECT COUNT(*) FROM dev_device WHERE gateway_id = ? AND status = 1", List.of(gatewayId)));
+        profile.put("recentAlarms", gatewayAlarms(gatewayId));
+        profile.put("alarmTrend", gatewayAlarmTrend(gatewayId));
+        profile.put("energyTrend", gatewayEnergyTrend(gatewayId));
+        profile.put("realtimeSnapshots", realtimeSnapshots(Map.of("gatewayId", String.valueOf(gatewayId))));
         return profile;
     }
 
@@ -193,6 +258,81 @@ public class PlatformBusinessQueryService {
                 ORDER BY id
                 """, typeId));
         return data;
+    }
+
+    private Long countDevicesByOrg(long orgId) {
+        List<Object> args = new ArrayList<>();
+        String scope = accessService.orgFilterSql("org_id", orgId, true, args);
+        return queryLong("SELECT COUNT(*) FROM dev_device WHERE 1 = 1" + scope, args);
+    }
+
+    private Long countGatewaysByOrg(long orgId) {
+        List<Object> args = new ArrayList<>();
+        String scope = accessService.orgFilterSql("org_id", orgId, true, args);
+        return queryLong("SELECT COUNT(*) FROM dev_gateway WHERE 1 = 1" + scope, args);
+    }
+
+    private List<Map<String, Object>> orgAlarms(long orgId) {
+        List<Object> args = new ArrayList<>();
+        String scope = accessService.orgFilterSql("e.org_id", orgId, true, args);
+        return jdbcTemplate.queryForList("""
+                SELECT e.*, d.device_sn, d.device_name
+                FROM log_alarm e
+                LEFT JOIN dev_device d ON d.id = e.device_id
+                WHERE 1 = 1
+                """ + scope + """
+                ORDER BY e.alarm_time DESC
+                LIMIT 10
+                """, args.toArray());
+    }
+
+    private List<Map<String, Object>> orgAlarmTrend(long orgId) {
+        List<Object> args = new ArrayList<>();
+        String scope = accessService.orgFilterSql("org_id", orgId, true, args);
+        return jdbcTemplate.queryForList("""
+                SELECT DATE(alarm_time) AS alarm_date, COUNT(*) AS alarm_count
+                FROM log_alarm
+                WHERE 1 = 1
+                """ + scope + """
+                GROUP BY DATE(alarm_time)
+                ORDER BY alarm_date DESC
+                LIMIT 14
+                """, args.toArray());
+    }
+
+    private List<Map<String, Object>> gatewayAlarms(long gatewayId) {
+        return jdbcTemplate.queryForList("""
+                SELECT e.*, d.device_sn, d.device_name
+                FROM log_alarm e
+                JOIN dev_device d ON d.id = e.device_id
+                WHERE d.gateway_id = ?
+                ORDER BY e.alarm_time DESC
+                LIMIT 10
+                """, gatewayId);
+    }
+
+    private List<Map<String, Object>> gatewayAlarmTrend(long gatewayId) {
+        return jdbcTemplate.queryForList("""
+                SELECT DATE(e.alarm_time) AS alarm_date, COUNT(*) AS alarm_count
+                FROM log_alarm e
+                JOIN dev_device d ON d.id = e.device_id
+                WHERE d.gateway_id = ?
+                GROUP BY DATE(e.alarm_time)
+                ORDER BY alarm_date DESC
+                LIMIT 14
+                """, gatewayId);
+    }
+
+    private List<Map<String, Object>> gatewayEnergyTrend(long gatewayId) {
+        return jdbcTemplate.queryForList("""
+                SELECT s.stat_date AS stat_period, ROUND(SUM(COALESCE(s.usage_value, 0)), 4) AS usage_value
+                FROM stats_daily_point s
+                JOIN dev_device d ON d.id = s.device_id
+                WHERE d.gateway_id = ?
+                GROUP BY s.stat_date
+                ORDER BY s.stat_date
+                LIMIT 30
+                """, gatewayId);
     }
 
     @Transactional
@@ -450,6 +590,50 @@ public class PlatformBusinessQueryService {
                 SELECT e.*, d.device_sn, d.device_name, o.org_name, r.rule_name
                 """ + from + where + " ORDER BY e.alarm_time DESC LIMIT ? OFFSET ?", pageArgs.toArray());
         return PageResult.of(rows, total == null ? 0 : total, pageNum, pageSize);
+    }
+
+    private List<Map<String, Object>> pruneTree(List<Map<String, Object>> nodes, String keyword) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> node : nodes) {
+            Map<String, Object> filtered = pruneNode(node, keyword);
+            if (filtered != null) {
+                result.add(filtered);
+            }
+        }
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> pruneNode(Map<String, Object> node, String keyword) {
+        List<Map<String, Object>> children = new ArrayList<>();
+        for (Map<String, Object> child : (List<Map<String, Object>>) node.getOrDefault("children", List.of())) {
+            Map<String, Object> filtered = pruneNode(child, keyword);
+            if (filtered != null) {
+                children.add(filtered);
+            }
+        }
+        boolean match = keyword == null || keyword.isBlank() || matches(node, keyword);
+        if (!match && children.isEmpty()) {
+            return null;
+        }
+        Map<String, Object> copy = new LinkedHashMap<>(node);
+        copy.put("children", children);
+        return copy;
+    }
+
+    private boolean matches(Map<String, Object> node, String keyword) {
+        String text = switch (Objects.toString(node.get("nodeType"), "")) {
+            case "GATEWAY" -> String.join(" ",
+                    Objects.toString(node.get("gateway_name"), ""),
+                    Objects.toString(node.get("gateway_sn"), ""));
+            case "DEVICE" -> String.join(" ",
+                    Objects.toString(node.get("device_name"), ""),
+                    Objects.toString(node.get("device_sn"), ""),
+                    Objects.toString(node.get("type_name"), ""));
+            default -> String.join(" ",
+                    Objects.toString(node.get("org_name"), ""));
+        };
+        return text.toLowerCase(java.util.Locale.ROOT).contains(keyword.toLowerCase(java.util.Locale.ROOT));
     }
 
     public Map<String, Object> alarmSummary(Map<String, String> params) {
