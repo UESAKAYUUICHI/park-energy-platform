@@ -87,6 +87,13 @@ public class DataScopeService {
         return visible == null || visible.contains(orgId);
     }
 
+    public List<Long> orgSubtreeIds(long rootOrgId) {
+        Map<Long, List<Long>> children = loadOrgChildren();
+        Set<Long> visible = new LinkedHashSet<>();
+        expand(rootOrgId, children, visible);
+        return new ArrayList<>(visible);
+    }
+
     public String inClause(String column, Set<Long> ids, List<Object> args) {
         if (ids == null) {
             return "";
