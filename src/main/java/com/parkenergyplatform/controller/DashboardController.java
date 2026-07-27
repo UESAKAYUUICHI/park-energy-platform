@@ -7,6 +7,7 @@ import com.parkenergyplatform.common.ApiResponse;
 import com.parkenergyplatform.service.DashboardService;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
@@ -20,7 +21,7 @@ public class DashboardController {
 
     @GetMapping("/summary")
     @SaCheckPermission("dashboard:view")
-    public ApiResponse<Map<String, Object>> summary() {
-        return ApiResponse.success(dashboardService.summary());
+    public ApiResponse<Map<String, Object>> summary(@RequestParam(required = false) Long rootOrgId) {
+        return ApiResponse.success(dashboardService.summary(rootOrgId));
     }
 }

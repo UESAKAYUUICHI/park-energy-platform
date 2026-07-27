@@ -190,3 +190,7 @@ GET /api/platform/dashboard/summary
 - 用户角色权限接口
 - 操作日志 AOP
 - 前端 Vue 管理页面
+
+## 业务闭环设计
+
+更细的父子模块闭环设计见 [BUSINESS_CLOSED_LOOP.md](./BUSINESS_CLOSED_LOOP.md)。

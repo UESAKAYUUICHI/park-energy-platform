@@ -36,9 +36,9 @@ public class BusinessWorkspaceService {
         this.dataScopeService = dataScopeService;
     }
 
-    public Map<String, Object> cockpit() {
+    public Map<String, Object> cockpit(Long rootOrgId) {
         Map<String, Object> data = new LinkedHashMap<>();
-        putSafely(data, "metrics", this::metrics, Map.of());
+        putSafely(data, "metrics", () -> metrics(rootOrgId), Map.of());
         putSafely(data, "deviceHealth", () -> {
             List<Object> deviceHealthArgs = new ArrayList<>();
             return jdbcTemplate.queryForList("""
@@ -49,7 +49,7 @@ public class BusinessWorkspaceService {
                 LEFT JOIN dev_org o ON o.id = d.org_id
                 LEFT JOIN dev_device_type t ON t.id = d.device_type_id
                 WHERE 1 = 1
-                """ + scopeSql("d.org_id", deviceHealthArgs) + """
+                """ + scopeSql("d.org_id", deviceHealthArgs, rootOrgId) + """
                 ORDER BY d.id DESC
                 LIMIT 12
                 """, deviceHealthArgs.toArray());
@@ -61,12 +61,12 @@ public class BusinessWorkspaceService {
                 SELECT stat_date, ROUND(SUM(COALESCE(usage_value, 0)), 4) AS usage_value
                 FROM stats_daily_point
                 WHERE stat_date >= ?
-                """ + scopeSql("org_id", trendArgs) + """
+                """ + scopeSql("org_id", trendArgs, rootOrgId) + """
                 GROUP BY stat_date
                 ORDER BY stat_date
                 """, trendArgs.toArray());
         }, List.of());
-        putSafely(data, "latestAlarms", () -> alarmEvents(6, null), List.of());
+        putSafely(data, "latestAlarms", () -> alarmEvents(6, null, rootOrgId), List.of());
         putSafely(data, "latestBills", () -> {
             List<Object> billArgs = new ArrayList<>();
             return jdbcTemplate.queryForList("""
@@ -74,7 +74,7 @@ public class BusinessWorkspaceService {
                 FROM billing_bill b
                 LEFT JOIN billing_account a ON a.id = b.account_id
                 WHERE 1 = 1
-                """ + scopeSql("a.org_id", billArgs) + """
+                """ + scopeSql("a.org_id", billArgs, rootOrgId) + """
                 ORDER BY b.id DESC
                 LIMIT 6
                 """, billArgs.toArray());
@@ -255,19 +255,19 @@ public class BusinessWorkspaceService {
         return Map.of("success", errors.isEmpty(), "points", points, "errors", errors);
     }
 
-    private Map<String, Object> metrics() {
+    private Map<String, Object> metrics(Long rootOrgId) {
         Map<String, Object> metrics = new LinkedHashMap<>();
-        metrics.put("orgCount", countScoped("dev_org", "id"));
-        metrics.put("gatewayCount", countScoped("dev_gateway", "org_id"));
-        metrics.put("onlineGatewayCount", countWhereScoped("dev_gateway", "org_id", "online_status = 1"));
-        metrics.put("deviceCount", countScoped("dev_device", "org_id"));
-        metrics.put("enabledDeviceCount", countWhereScoped("dev_device", "org_id", "status = 1"));
+        metrics.put("orgCount", countScoped("dev_org", "id", rootOrgId));
+        metrics.put("gatewayCount", countScoped("dev_gateway", "org_id", rootOrgId));
+        metrics.put("onlineGatewayCount", countWhereScoped("dev_gateway", "org_id", "online_status = 1", rootOrgId));
+        metrics.put("deviceCount", countScoped("dev_device", "org_id", rootOrgId));
+        metrics.put("enabledDeviceCount", countWhereScoped("dev_device", "org_id", "status = 1", rootOrgId));
         metrics.put("pointCount", count("dev_point_definition"));
         metrics.put("billablePointCount", countWhere("dev_point_definition", "billable = 1"));
-        metrics.put("pendingAlarmCount", countWhereScoped("log_alarm", "org_id", "deal_status = 0"));
-        metrics.put("unpaidBillCount", billingBillCount("b.pay_status = 0"));
-        metrics.put("totalReceivable", billingBillSum("b.pay_status IN (0,2)"));
-        metrics.put("todayUsage", sumScoped("stats_daily_point", "usage_value", "org_id", "stat_date = CURDATE()"));
+        metrics.put("pendingAlarmCount", countWhereScoped("log_alarm", "org_id", "deal_status = 0", rootOrgId));
+        metrics.put("unpaidBillCount", billingBillCount("b.pay_status = 0", rootOrgId));
+        metrics.put("totalReceivable", billingBillSum("b.pay_status IN (0,2)", rootOrgId));
+        metrics.put("todayUsage", sumScoped("stats_daily_point", "usage_value", "org_id", "stat_date = CURDATE()", rootOrgId));
         return metrics;
     }
 
@@ -302,13 +302,17 @@ public class BusinessWorkspaceService {
     }
 
     private List<Map<String, Object>> alarmEvents(int limit, Integer dealStatus) {
+        return alarmEvents(limit, dealStatus, null);
+    }
+
+    private List<Map<String, Object>> alarmEvents(int limit, Integer dealStatus, Long rootOrgId) {
         List<Object> args = new ArrayList<>();
         String where = "WHERE 1 = 1 ";
         if (dealStatus != null) {
             where += "AND e.deal_status = ? ";
             args.add(dealStatus);
         }
-        where += scopeSql("e.org_id", args);
+        where += scopeSql("e.org_id", args, rootOrgId);
         args.add(limit);
         return jdbcTemplate.queryForList("""
                 SELECT e.*, d.device_name, o.org_name, r.rule_name
@@ -411,8 +415,12 @@ public class BusinessWorkspaceService {
     }
 
     private long countScoped(String table, String orgColumn) {
+        return countScoped(table, orgColumn, null);
+    }
+
+    private long countScoped(String table, String orgColumn, Long rootOrgId) {
         List<Object> args = new ArrayList<>();
-        Long value = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM " + table + " WHERE 1 = 1" + scopeSql(orgColumn, args), Long.class, args.toArray());
+        Long value = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM " + table + " WHERE 1 = 1" + scopeSql(orgColumn, args, rootOrgId), Long.class, args.toArray());
         return value == null ? 0 : value;
     }
 
@@ -422,8 +430,12 @@ public class BusinessWorkspaceService {
     }
 
     private long countWhereScoped(String table, String orgColumn, String where) {
+        return countWhereScoped(table, orgColumn, where, null);
+    }
+
+    private long countWhereScoped(String table, String orgColumn, String where, Long rootOrgId) {
         List<Object> args = new ArrayList<>();
-        Long value = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM " + table + " WHERE " + where + scopeSql(orgColumn, args), Long.class, args.toArray());
+        Long value = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM " + table + " WHERE " + where + scopeSql(orgColumn, args, rootOrgId), Long.class, args.toArray());
         return value == null ? 0 : value;
     }
 
@@ -433,36 +445,61 @@ public class BusinessWorkspaceService {
     }
 
     private BigDecimal sumScoped(String table, String column, String orgColumn, String where) {
+        return sumScoped(table, column, orgColumn, where, null);
+    }
+
+    private BigDecimal sumScoped(String table, String column, String orgColumn, String where, Long rootOrgId) {
         List<Object> args = new ArrayList<>();
-        BigDecimal value = jdbcTemplate.queryForObject("SELECT COALESCE(SUM(" + column + "), 0) FROM " + table + " WHERE " + where + scopeSql(orgColumn, args), BigDecimal.class, args.toArray());
+        BigDecimal value = jdbcTemplate.queryForObject("SELECT COALESCE(SUM(" + column + "), 0) FROM " + table + " WHERE " + where + scopeSql(orgColumn, args, rootOrgId), BigDecimal.class, args.toArray());
         return value == null ? BigDecimal.ZERO : value;
     }
 
     private long billingBillCount(String where) {
+        return billingBillCount(where, null);
+    }
+
+    private long billingBillCount(String where, Long rootOrgId) {
         List<Object> args = new ArrayList<>();
         Long value = jdbcTemplate.queryForObject("""
                 SELECT COUNT(*)
                 FROM billing_bill b
                 JOIN billing_account a ON a.id = b.account_id
-                WHERE """ + where + scopeSql("a.org_id", args), Long.class, args.toArray());
+                WHERE """ + where + scopeSql("a.org_id", args, rootOrgId), Long.class, args.toArray());
         return value == null ? 0 : value;
     }
 
     private BigDecimal billingBillSum(String where) {
+        return billingBillSum(where, null);
+    }
+
+    private BigDecimal billingBillSum(String where, Long rootOrgId) {
         List<Object> args = new ArrayList<>();
         BigDecimal value = jdbcTemplate.queryForObject("""
                 SELECT COALESCE(SUM(b.total_amount), 0)
                 FROM billing_bill b
                 JOIN billing_account a ON a.id = b.account_id
-                WHERE """ + where + scopeSql("a.org_id", args), BigDecimal.class, args.toArray());
+                WHERE """ + where + scopeSql("a.org_id", args, rootOrgId), BigDecimal.class, args.toArray());
         return value == null ? BigDecimal.ZERO : value;
     }
 
     private String scopeSql(String orgColumn, List<Object> args) {
+        return scopeSql(orgColumn, args, null);
+    }
+
+    private String scopeSql(String orgColumn, List<Object> args, Long rootOrgId) {
         if (!StpUtil.isLogin()) {
             return "";
         }
-        Set<Long> visibleOrgIds = dataScopeService.visibleOrgIds(StpUtil.getLoginIdAsLong());
+        long userId = StpUtil.getLoginIdAsLong();
+        Set<Long> visibleOrgIds;
+        if (rootOrgId != null) {
+            if (!dataScopeService.hasOrgAccess(userId, rootOrgId)) {
+                throw new BusinessException(403, "没有该组织的数据访问权限");
+            }
+            visibleOrgIds = new java.util.LinkedHashSet<>(dataScopeService.orgSubtreeIds(rootOrgId));
+        } else {
+            visibleOrgIds = dataScopeService.visibleOrgIds(userId);
+        }
         return dataScopeService.inClause(orgColumn, visibleOrgIds, args);
     }
 
