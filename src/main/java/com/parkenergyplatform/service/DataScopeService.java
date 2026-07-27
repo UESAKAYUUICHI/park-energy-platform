@@ -59,22 +59,10 @@ public class DataScopeService {
     }
 
     public Set<Long> visibleOrgIds(long userId) {
-        List<ScopeNode> roots = scopeRoots(userId);
-        if (!roots.isEmpty()) {
-            Map<Long, List<Long>> children = loadOrgChildren();
-            Set<Long> visible = new LinkedHashSet<>();
-            for (ScopeNode root : roots) {
-                if ("SUBTREE".equalsIgnoreCase(root.scopeMode())) {
-                    expand(root.orgId(), children, visible);
-                } else {
-                    visible.add(root.orgId());
-                }
-            }
-            return visible;
-        }
         if (isSuperAdmin(userId)) {
             return null;
         }
+        List<ScopeNode> roots = scopeRoots(userId);
         if (roots.isEmpty()) {
             Long orgId = userOrgId(userId);
             if (orgId == null) {
