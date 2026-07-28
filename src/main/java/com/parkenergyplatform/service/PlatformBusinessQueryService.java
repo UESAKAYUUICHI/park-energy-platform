@@ -50,6 +50,24 @@ public class PlatformBusinessQueryService {
     }
 
     public List<Map<String, Object>> rootOrgs() {
+        if (StpUtil.isLogin()) {
+            Set<Long> visibleOrgIds = dataScopeService.visibleOrgIds(StpUtil.getLoginIdAsLong());
+            if (visibleOrgIds != null) {
+                if (visibleOrgIds.isEmpty()) {
+                    return List.of();
+                }
+                List<Object> args = new ArrayList<>(visibleOrgIds);
+                args.addAll(visibleOrgIds);
+                String placeholders = String.join(",", java.util.Collections.nCopies(visibleOrgIds.size(), "?"));
+                return jdbcTemplate.queryForList("""
+                        SELECT id, parent_id, org_name, org_type, sort
+                        FROM dev_org
+                        WHERE id IN (%s)
+                          AND (parent_id IS NULL OR parent_id = 0 OR parent_id NOT IN (%s))
+                        ORDER BY sort, id
+                        """.formatted(placeholders, placeholders), args.toArray());
+            }
+        }
         List<Object> args = new ArrayList<>();
         return jdbcTemplate.queryForList("""
                 SELECT id, parent_id, org_name, org_type, sort
@@ -282,12 +300,14 @@ public class PlatformBusinessQueryService {
     public Map<String, Object> deviceTypePoints(long typeId) {
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("deviceType", singleOrNull("SELECT * FROM dev_device_type WHERE id = ?", typeId));
-        data.put("definitions", jdbcTemplate.queryForList("""
+        List<Map<String, Object>> definitions = jdbcTemplate.queryForList("""
                 SELECT *
                 FROM dev_point_definition
                 WHERE device_type_id = ?
                 ORDER BY sort, id
-                """, typeId));
+                """, typeId);
+        data.put("definitions", definitions);
+        ensureDefaultPointMappings(typeId, definitions);
         data.put("mappings", jdbcTemplate.queryForList("""
                 SELECT *
                 FROM dev_point_mapping
@@ -384,6 +404,7 @@ public class PlatformBusinessQueryService {
         List<Map<String, Object>> mappings = request.get("mappings") instanceof List<?> list
                 ? list.stream().filter(Map.class::isInstance).map(item -> (Map<String, Object>) item).toList()
                 : List.of();
+        List<Map<String, Object>> mappingsToSave = normalizedPointMappings(definitions, mappings);
         jdbcTemplate.update("DELETE FROM dev_point_mapping WHERE device_type_id = ?", typeId);
         jdbcTemplate.update("DELETE FROM dev_point_definition WHERE device_type_id = ?", typeId);
         for (Map<String, Object> definition : definitions) {
@@ -404,27 +425,89 @@ public class PlatformBusinessQueryService {
                     integerOrDefault(definition, 0, "sort"),
                     integerOrDefault(definition, 1, "enabled"));
         }
-        for (Map<String, Object> mapping : mappings) {
-            jdbcTemplate.update("""
-                    INSERT INTO dev_point_mapping
-                      (device_type_id, point_code, protocol_type, source_path, function_code, register_address,
-                       register_length, value_type, byte_order, scale_factor, offset_value, expression, required)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, typeId,
-                    text(mapping, "pointCode", "point_code"),
-                    textOrDefault(mapping, "protocolType", "protocol_type", "JSON"),
-                    text(mapping, "sourcePath", "source_path"),
-                    text(mapping, "functionCode", "function_code"),
-                    integerOrNull(mapping, "registerAddress", "register_address"),
-                    integerOrNull(mapping, "registerLength", "register_length"),
-                    textOrDefault(mapping, "valueType", "value_type", "DOUBLE"),
-                    text(mapping, "byteOrder", "byte_order"),
-                    decimalOrDefault(mapping, BigDecimal.ONE, "scaleFactor", "scale_factor"),
-                    decimalOrDefault(mapping, BigDecimal.ZERO, "offsetValue", "offset_value"),
-                    text(mapping, "expression"),
-                    integerOrDefault(mapping, 0, "required"));
-        }
+        for (Map<String, Object> mapping : mappingsToSave) insertPointMapping(typeId, mapping);
         return deviceTypePoints(typeId);
+    }
+
+    private void ensureDefaultPointMappings(long typeId, List<Map<String, Object>> definitions) {
+        if (typeId <= 0 || definitions.isEmpty()) {
+            return;
+        }
+        List<Map<String, Object>> existingMappings = jdbcTemplate.queryForList(
+                "SELECT * FROM dev_point_mapping WHERE device_type_id = ?", typeId);
+        Set<String> existingCodes = new LinkedHashSet<>();
+        for (Map<String, Object> mapping : existingMappings) {
+            String pointCode = text(mapping, "pointCode", "point_code");
+            if (pointCode != null && !pointCode.isBlank()) {
+                existingCodes.add(pointCode);
+            }
+        }
+        for (Map<String, Object> mapping : normalizedPointMappings(definitions, existingMappings)) {
+            String pointCode = text(mapping, "pointCode", "point_code");
+            if (pointCode != null && !existingCodes.contains(pointCode)) {
+                insertPointMapping(typeId, mapping);
+            }
+        }
+    }
+
+    private void insertPointMapping(long typeId, Map<String, Object> mapping) {
+        jdbcTemplate.update("""
+                INSERT INTO dev_point_mapping
+                  (device_type_id, point_code, protocol_type, source_path, function_code, register_address,
+                   register_length, value_type, byte_order, scale_factor, offset_value, expression, required)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, typeId,
+                text(mapping, "pointCode", "point_code"),
+                textOrDefault(mapping, "protocolType", "protocol_type", "JSON"),
+                text(mapping, "sourcePath", "source_path"),
+                text(mapping, "functionCode", "function_code"),
+                integerOrNull(mapping, "registerAddress", "register_address"),
+                integerOrNull(mapping, "registerLength", "register_length"),
+                textOrDefault(mapping, "valueType", "value_type", "DOUBLE"),
+                text(mapping, "byteOrder", "byte_order"),
+                decimalOrDefault(mapping, BigDecimal.ONE, "scaleFactor", "scale_factor"),
+                decimalOrDefault(mapping, BigDecimal.ZERO, "offsetValue", "offset_value"),
+                text(mapping, "expression"),
+                integerOrDefault(mapping, 0, "required"));
+    }
+
+    private List<Map<String, Object>> normalizedPointMappings(List<Map<String, Object>> definitions,
+                                                              List<Map<String, Object>> mappings) {
+        Set<String> definitionCodes = new LinkedHashSet<>();
+        Map<String, String> valueTypes = new LinkedHashMap<>();
+        for (Map<String, Object> definition : definitions) {
+            String pointCode = text(definition, "pointCode", "point_code");
+            if (pointCode == null || pointCode.isBlank()) {
+                continue;
+            }
+            definitionCodes.add(pointCode);
+            valueTypes.put(pointCode, textOrDefault(definition, "dataType", "data_type", "DOUBLE"));
+        }
+
+        Map<String, Map<String, Object>> byPointCode = new LinkedHashMap<>();
+        for (Map<String, Object> mapping : mappings) {
+            String pointCode = text(mapping, "pointCode", "point_code");
+            if (pointCode == null || pointCode.isBlank() || !definitionCodes.contains(pointCode)) {
+                continue;
+            }
+            byPointCode.put(pointCode, mapping);
+        }
+
+        for (String pointCode : definitionCodes) {
+            if (byPointCode.containsKey(pointCode)) {
+                continue;
+            }
+            Map<String, Object> mapping = new LinkedHashMap<>();
+            mapping.put("point_code", pointCode);
+            mapping.put("protocol_type", "JSON");
+            mapping.put("source_path", "$." + pointCode);
+            mapping.put("value_type", valueTypes.getOrDefault(pointCode, "DOUBLE"));
+            mapping.put("scale_factor", BigDecimal.ONE);
+            mapping.put("offset_value", BigDecimal.ZERO);
+            mapping.put("required", 0);
+            byPointCode.put(pointCode, mapping);
+        }
+        return new ArrayList<>(byPointCode.values());
     }
 
     public Map<String, Object> realtimeBatch(List<Long> deviceIds) {
