@@ -168,36 +168,48 @@ public class PlatformBusinessQueryService {
         Map<String, Object> profile = deviceProfile(deviceId);
         Map<String, Object> device = castMap(profile.get("device"));
         Long orgId = longOrNull(device.get("org_id"));
-        profile.put("recentHistory", jdbcTemplate.queryForList("""
+        Map<String, Object> points = castMap(profile.get("points"));
+        List<Map<String, Object>> recentHistory = jdbcTemplate.queryForList("""
                 SELECT id, device_id, device_type_id, org_id, point_code, stat_date,
                        start_value, end_value, usage_value, max_value, min_value, avg_value, data_complete_rate
                 FROM stats_daily_point
                 WHERE device_id = ?
                 ORDER BY stat_date DESC, point_code
                 LIMIT 12
-                """, deviceId));
-        profile.put("recentAlarms", jdbcTemplate.queryForList("""
+                """, deviceId);
+        List<Map<String, Object>> recentAlarms = jdbcTemplate.queryForList("""
                 SELECT id, rule_id, device_id, org_id, alarm_type, alarm_level, point_code,
                        alarm_value, threshold_value, alarm_time, deal_status, deal_time, deal_user, deal_remark
                 FROM log_alarm
                 WHERE device_id = ?
                 ORDER BY alarm_time DESC
                 LIMIT 8
-                """, deviceId));
-        profile.put("inspectionRecords", jdbcTemplate.queryForList("""
+                """, deviceId);
+        List<Map<String, Object>> inspectionRecords = jdbcTemplate.queryForList("""
                 SELECT id, command_id, gateway_id, target_type, target_id, target_sn, command_type,
                        status, request_time, send_time, response_time, fail_reason, create_time
                 FROM command_record
                 WHERE target_type = 'DEVICE' AND target_id = ?
                 ORDER BY request_time DESC
                 LIMIT 8
-                """, deviceId));
+                """, deviceId);
+        profile.put("recentHistory", recentHistory);
+        profile.put("recentAlarms", recentAlarms);
+        profile.put("inspectionRecords", inspectionRecords);
         Map<String, String> trendParams = new LinkedHashMap<>();
         trendParams.put("deviceId", String.valueOf(deviceId));
         if (orgId != null) {
             trendParams.put("orgId", String.valueOf(orgId));
         }
-        profile.put("energyTrend", energyTrend(trendParams));
+        List<Map<String, Object>> energyTrend = energyTrend(trendParams);
+        profile.put("energyTrend", energyTrend);
+        profile.put("summary", Map.of(
+                "pointCount", ((List<?>) points.getOrDefault("definitions", List.of())).size(),
+                "historyCount", recentHistory.size(),
+                "alarmCount", recentAlarms.size(),
+                "commandCount", inspectionRecords.size(),
+                "energyTrendCount", energyTrend.size()
+        ));
         return profile;
     }
 
@@ -216,10 +228,23 @@ public class PlatformBusinessQueryService {
                 FROM dev_gateway
                 WHERE online_status = 1
                 """ + onlineGatewayScope, onlineGatewayArgs));
-        profile.put("recentAlarms", orgAlarms(orgId));
-        profile.put("alarmTrend", orgAlarmTrend(orgId));
-        profile.put("energyTrend", energyTrend(Map.of("orgId", String.valueOf(orgId))));
-        profile.put("realtimeSnapshots", realtimeSnapshots(Map.of("orgId", String.valueOf(orgId))));
+        List<Map<String, Object>> recentAlarms = orgAlarms(orgId);
+        List<Map<String, Object>> alarmTrend = orgAlarmTrend(orgId);
+        List<Map<String, Object>> energyTrend = energyTrend(Map.of("orgId", String.valueOf(orgId)));
+        List<Map<String, Object>> realtimeSnapshots = realtimeSnapshots(Map.of("orgId", String.valueOf(orgId)));
+        profile.put("recentAlarms", recentAlarms);
+        profile.put("alarmTrend", alarmTrend);
+        profile.put("energyTrend", energyTrend);
+        profile.put("realtimeSnapshots", realtimeSnapshots);
+        profile.put("summary", Map.of(
+                "deviceCount", profile.get("deviceCount"),
+                "gatewayCount", profile.get("gatewayCount"),
+                "onlineGatewayCount", profile.get("onlineGatewayCount"),
+                "alarmCount", recentAlarms.size(),
+                "alarmTrendCount", alarmTrend.size(),
+                "energyTrendCount", energyTrend.size(),
+                "realtimeSnapshotCount", realtimeSnapshots.size()
+        ));
         return profile;
     }
 
@@ -235,10 +260,22 @@ public class PlatformBusinessQueryService {
         profile.put("gateway", gateway);
         profile.put("deviceCount", queryLong("SELECT COUNT(*) FROM dev_device WHERE gateway_id = ?", List.of(gatewayId)));
         profile.put("onlineDeviceCount", queryLong("SELECT COUNT(*) FROM dev_device WHERE gateway_id = ? AND status = 1", List.of(gatewayId)));
-        profile.put("recentAlarms", gatewayAlarms(gatewayId));
-        profile.put("alarmTrend", gatewayAlarmTrend(gatewayId));
-        profile.put("energyTrend", gatewayEnergyTrend(gatewayId));
-        profile.put("realtimeSnapshots", realtimeSnapshots(Map.of("gatewayId", String.valueOf(gatewayId))));
+        List<Map<String, Object>> recentAlarms = gatewayAlarms(gatewayId);
+        List<Map<String, Object>> alarmTrend = gatewayAlarmTrend(gatewayId);
+        List<Map<String, Object>> energyTrend = gatewayEnergyTrend(gatewayId);
+        List<Map<String, Object>> realtimeSnapshots = realtimeSnapshots(Map.of("gatewayId", String.valueOf(gatewayId)));
+        profile.put("recentAlarms", recentAlarms);
+        profile.put("alarmTrend", alarmTrend);
+        profile.put("energyTrend", energyTrend);
+        profile.put("realtimeSnapshots", realtimeSnapshots);
+        profile.put("summary", Map.of(
+                "deviceCount", profile.get("deviceCount"),
+                "onlineDeviceCount", profile.get("onlineDeviceCount"),
+                "alarmCount", recentAlarms.size(),
+                "alarmTrendCount", alarmTrend.size(),
+                "energyTrendCount", energyTrend.size(),
+                "realtimeSnapshotCount", realtimeSnapshots.size()
+        ));
         return profile;
     }
 
@@ -577,6 +614,7 @@ public class PlatformBusinessQueryService {
         StringBuilder where = new StringBuilder();
         appendOrgFilter(where, args, "e.org_id", params);
         appendEquals(where, args, "e.device_id", params.get("deviceId"));
+        appendEquals(where, args, "d.gateway_id", params.get("gatewayId"));
         appendEquals(where, args, "e.deal_status", params.get("dealStatus"));
         appendDateRange(where, args, "e.alarm_time", params.get("startTime"), params.get("endTime"));
         where.append(scopeSql("e.org_id", args));

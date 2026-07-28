@@ -194,3 +194,7 @@ GET /api/platform/dashboard/summary
 ## 业务闭环设计
 
 更细的父子模块闭环设计见 [BUSINESS_CLOSED_LOOP.md](./BUSINESS_CLOSED_LOOP.md)。
+
+## 第一阶段设计
+
+第一阶段开发拆解见 [PHASE1_MODULE_DESIGN.md](./PHASE1_MODULE_DESIGN.md)。
