@@ -71,6 +71,7 @@ public class SimpleTableService {
     public Map<String, Object> create(String resource, Map<String, Object> body) {
         TableDefinition definition = tableRegistry.get(resource);
         Map<String, Object> values = writableValues(definition, body, false);
+        applyDefaultDeviceOrg(definition, values);
         if (values.isEmpty()) {
             throw new BusinessException("没有可保存字段");
         }
@@ -140,6 +141,39 @@ public class SimpleTableService {
         return create(resource, values);
     }
 
+    @Transactional
+    public List<Map<String, Object>> bindDevicesToGateway(long gatewayId, Map<String, Object> body) {
+        accessService.assertGatewayAccess(gatewayId);
+        Map<String, Object> gateway = single("SELECT * FROM dev_gateway WHERE id = ?", gatewayId);
+        Long orgId = longOrNull(gateway.get("org_id"));
+        List<Long> ids = deviceIds(body.get("ids"));
+        if (ids.isEmpty()) {
+            throw new BusinessException("请选择需要绑定的设备");
+        }
+        for (Long deviceId : ids) {
+            Map<String, Object> device = single("SELECT id, org_id, gateway_id FROM dev_device WHERE id = ?", deviceId);
+            Long currentOrgId = longOrNull(device.get("org_id"));
+            if (currentOrgId != null) {
+                assertOrgAccess(currentOrgId);
+            }
+            Long currentGatewayId = longOrNull(device.get("gateway_id"));
+            if (currentGatewayId != null && !Objects.equals(currentGatewayId, gatewayId)) {
+                accessService.assertGatewayAccess(currentGatewayId);
+            }
+            jdbcTemplate.update("UPDATE dev_device SET gateway_id = ?, org_id = ? WHERE id = ?", gatewayId, orgId, deviceId);
+        }
+        String placeholders = placeholders(ids.size());
+        List<Object> args = new ArrayList<>(ids);
+        return jdbcTemplate.queryForList("""
+                SELECT d.*, g.gateway_name, g.gateway_sn, o.org_name, t.type_name, t.type_code
+                FROM dev_device d
+                LEFT JOIN dev_gateway g ON g.id = d.gateway_id
+                LEFT JOIN dev_org o ON o.id = d.org_id
+                LEFT JOIN dev_device_type t ON t.id = d.device_type_id
+                WHERE d.id IN (
+                """ + placeholders + ")", args.toArray());
+    }
+
     private String uniqueCopyCode(String base, long id) {
         String cleaned = base == null ? "" : base.trim();
         return cleaned + "-COPY-" + id + "-" + Long.toString(System.currentTimeMillis(), 36).toUpperCase(Locale.ROOT);
@@ -168,6 +202,14 @@ public class SimpleTableService {
     private long count(String sql, long id) {
         Long value = jdbcTemplate.queryForObject(sql, Long.class, id);
         return value == null ? 0L : value;
+    }
+
+    private Map<String, Object> single(String sql, Object... args) {
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, args);
+        if (rows.isEmpty()) {
+            throw new BusinessException(404, "数据不存在");
+        }
+        return rows.get(0);
     }
 
     private String appendDataScope(TableDefinition definition, String where, List<Object> args) {
@@ -203,6 +245,21 @@ public class SimpleTableService {
             assertOrgAccess(orgId);
         }
         checkRelatedWritableDataScope(definition, values);
+    }
+
+    private void applyDefaultDeviceOrg(TableDefinition definition, Map<String, Object> values) {
+        if (!"devices".equals(definition.resource()) || longOrNull(values.get("org_id")) != null || !StpUtil.isLogin()) {
+            return;
+        }
+        Set<Long> visibleOrgIds = dataScopeService.visibleOrgIds(StpUtil.getLoginIdAsLong());
+        if (visibleOrgIds != null && !visibleOrgIds.isEmpty()) {
+            values.put("org_id", visibleOrgIds.iterator().next());
+            return;
+        }
+        List<Long> orgIds = jdbcTemplate.queryForList("SELECT id FROM dev_org ORDER BY parent_id, sort, id LIMIT 1", Long.class);
+        if (!orgIds.isEmpty()) {
+            values.put("org_id", orgIds.get(0));
+        }
     }
 
     private String relatedDataScopeSql(TableDefinition definition, Set<Long> visibleOrgIds, List<Object> args) {
@@ -365,7 +422,10 @@ public class SimpleTableService {
 
     private void assertGatewayFieldAccess(Map<String, Object> values) {
         if (values.containsKey("gateway_id")) {
-            accessService.assertGatewayAccess(longOrNull(values.get("gateway_id")));
+            Long gatewayId = longOrNull(values.get("gateway_id"));
+            if (gatewayId != null) {
+                accessService.assertGatewayAccess(gatewayId);
+            }
         }
     }
 
@@ -505,6 +565,24 @@ public class SimpleTableService {
             return null;
         }
         return Long.valueOf(value.toString());
+    }
+
+    private List<Long> deviceIds(Object value) {
+        if (value instanceof List<?> list) {
+            return list.stream().map(this::longOrNull).filter(Objects::nonNull).toList();
+        }
+        if (value == null || value.toString().isBlank()) {
+            return List.of();
+        }
+        return java.util.Arrays.stream(value.toString().split(","))
+                .map(String::trim)
+                .filter(item -> !item.isBlank())
+                .map(Long::valueOf)
+                .toList();
+    }
+
+    private String placeholders(int size) {
+        return String.join(",", java.util.Collections.nCopies(size, "?"));
     }
 
     private String toSnake(String input) {

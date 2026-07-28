@@ -96,6 +96,13 @@ public class ArchiveController {
         return ApiResponse.success(workspaceService.parseTest(request));
     }
 
+    @PostMapping("/gateways/{gatewayId}/bind-devices")
+    @SaCheckPermission("archive:edit")
+    @OperationLog(module = "档案管理", operation = "绑定网关设备")
+    public ApiResponse<Object> bindDevices(@PathVariable long gatewayId, @RequestBody Map<String, Object> body) {
+        return ApiResponse.success(tableService.bindDevicesToGateway(gatewayId, body));
+    }
+
     @GetMapping("/{resource}")
     @SaCheckPermission("archive:list")
     public ApiResponse<PageResult<Map<String, Object>>> page(@PathVariable String resource, HttpServletRequest request) {

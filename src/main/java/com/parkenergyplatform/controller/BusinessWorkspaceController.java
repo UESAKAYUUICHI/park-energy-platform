@@ -22,12 +22,6 @@ public class BusinessWorkspaceController {
         this.workspaceService = workspaceService;
     }
 
-    @GetMapping("/cockpit")
-    @SaCheckPermission("dashboard:view")
-    public ApiResponse<Map<String, Object>> cockpit(@RequestParam(required = false) Long rootOrgId) {
-        return ApiResponse.success(workspaceService.cockpit(rootOrgId));
-    }
-
     @GetMapping("/archive")
     @SaCheckPermission("archive:list")
     public ApiResponse<Map<String, Object>> archive() {
