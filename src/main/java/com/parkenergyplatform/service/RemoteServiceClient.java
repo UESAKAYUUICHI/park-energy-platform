@@ -23,8 +23,24 @@ public class RemoteServiceClient {
         return exchange(dataClient.get().uri(uri), "data", uri);
     }
 
+    public Map<String, Object> getData(String uri, Map<String, String> params) {
+        return exchange(dataClient.get().uri(builder -> {
+            var query = builder.path(uri);
+            params.forEach((key, value) -> query.queryParam(key, value));
+            return query.build();
+        }), "data", uri);
+    }
+
     public Map<String, Object> postData(String uri, Object body) {
         return exchange(dataClient.post().uri(uri).body(body), "data", uri);
+    }
+
+    public Map<String, Object> postData(String uri, Map<String, String> params) {
+        return exchange(dataClient.post().uri(builder -> {
+            var query = builder.path(uri);
+            params.forEach((key, value) -> query.queryParam(key, value));
+            return query.build();
+        }), "data", uri);
     }
 
     public Map<String, Object> getAccess(String uri) {

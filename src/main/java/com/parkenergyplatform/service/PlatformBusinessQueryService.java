@@ -16,6 +16,8 @@ import java.util.Set;
 import java.util.StringJoiner;
 
 import cn.dev33.satoken.stp.StpUtil;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.parkenergyplatform.common.BusinessException;
 import com.parkenergyplatform.common.PageResult;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -28,13 +30,18 @@ public class PlatformBusinessQueryService {
     private final BusinessDataAccessService accessService;
     private final DataScopeService dataScopeService;
     private final RemoteServiceClient remoteServiceClient;
+    private final DeviceCatalogService deviceCatalogService;
+    private final ObjectMapper objectMapper;
 
     public PlatformBusinessQueryService(JdbcTemplate jdbcTemplate, BusinessDataAccessService accessService,
-                                        DataScopeService dataScopeService, RemoteServiceClient remoteServiceClient) {
+                                        DataScopeService dataScopeService, RemoteServiceClient remoteServiceClient,
+                                        DeviceCatalogService deviceCatalogService, ObjectMapper objectMapper) {
         this.jdbcTemplate = jdbcTemplate;
         this.accessService = accessService;
         this.dataScopeService = dataScopeService;
         this.remoteServiceClient = remoteServiceClient;
+        this.deviceCatalogService = deviceCatalogService;
+        this.objectMapper = objectMapper;
     }
 
     public List<Map<String, Object>> orgTree() {
@@ -115,24 +122,22 @@ public class PlatformBusinessQueryService {
                 SELECT id, gateway_sn, gateway_name, org_id, online_status, status
                 FROM dev_gateway
                 WHERE 1 = 1
-                """ + scopeSql("org_id", gatewayArgs) + """
-                ORDER BY id
-                """, gatewayArgs.toArray());
+                """ + scopeSql("org_id", gatewayArgs) + " ORDER BY id", gatewayArgs.toArray());
         Map<Long, Map<String, Object>> gatewayNodes = new LinkedHashMap<>();
         for (Map<String, Object> gateway : gateways) {
             Map<String, Object> node = new LinkedHashMap<>(gateway);
             node.put("nodeType", "GATEWAY");
             node.put("children", new ArrayList<Map<String, Object>>());
             gatewayNodes.put(longValue(gateway.get("id")), node);
-            Map<String, Object> org = orgNodes.get(longValue(gateway.get("org_id")));
-            if (org != null) {
-                children(org).add(node);
-            }
+            Long gatewayOrgId = longOrNull(gateway.get("org_id"));
+            Map<String, Object> org = gatewayOrgId == null ? null : orgNodes.get(gatewayOrgId);
+            if (org != null) children(org).add(node);
         }
 
         List<Object> deviceArgs = new ArrayList<>();
         List<Map<String, Object>> devices = jdbcTemplate.queryForList("""
-                SELECT d.id, d.device_sn, d.device_name, d.gateway_id, d.org_id, d.device_type_id, d.status,
+                SELECT d.id, d.device_sn, d.device_name, d.gateway_id, d.org_id, d.space_id,
+                       d.device_type_id, d.model_version_id, d.protocol_addr, d.settlement_enabled, d.status,
                        t.type_code, t.type_name
                 FROM dev_device d
                 LEFT JOIN dev_device_type t ON t.id = d.device_type_id
@@ -144,15 +149,9 @@ public class PlatformBusinessQueryService {
             Map<String, Object> node = new LinkedHashMap<>(device);
             node.put("nodeType", "DEVICE");
             Long gatewayId = longOrNull(device.get("gateway_id"));
-            Map<String, Object> gateway = gatewayId == null ? null : gatewayNodes.get(gatewayId);
-            if (gateway != null) {
-                children(gateway).add(node);
-            } else {
-                Map<String, Object> org = orgNodes.get(longValue(device.get("org_id")));
-                if (org != null) {
-                    children(org).add(node);
-                }
-            }
+            Map<String, Object> parent = gatewayId == null ? null : gatewayNodes.get(gatewayId);
+            if (parent == null) parent = orgNodes.get(longValue(device.get("org_id")));
+            if (parent != null) children(parent).add(node);
         }
         return pruneTree(roots, keyword);
     }
@@ -161,17 +160,45 @@ public class PlatformBusinessQueryService {
         accessService.assertDeviceAccess(deviceId);
         Map<String, Object> profile = new LinkedHashMap<>();
         Map<String, Object> device = single("""
-                SELECT d.*, o.org_name, g.gateway_sn, g.gateway_name, g.online_status, t.type_code, t.type_name, t.protocol_type
+                SELECT d.*, o.org_name, g.gateway_sn, g.gateway_name, g.online_status,sp.space_code,sp.space_name,sp.space_type,
+                       t.type_code, t.type_name, t.protocol_type,
+                       v.version_name AS model_version_name, v.status AS model_version_status,
+                       m.id AS catalog_model_id, m.model_code AS catalog_model_code, m.model_name AS catalog_model_name,
+                       s.series_name AS catalog_series_name, b.brand_name AS catalog_brand_name,
+                       c.id AS catalog_category_id, c.category_name AS catalog_category_name
                 FROM dev_device d
                 LEFT JOIN dev_org o ON o.id = d.org_id
                 LEFT JOIN dev_gateway g ON g.id = d.gateway_id
+                LEFT JOIN park_space sp ON sp.id = d.space_id
                 LEFT JOIN dev_device_type t ON t.id = d.device_type_id
+                LEFT JOIN dev_device_model_version v ON v.id = d.model_version_id
+                LEFT JOIN dev_device_model m ON m.id = v.model_id
+                LEFT JOIN dev_product_series s ON s.id = m.series_id
+                LEFT JOIN dev_brand b ON b.id = s.brand_id
+                LEFT JOIN dev_device_category c ON c.id = s.category_id
                 WHERE d.id = ?
                 """, deviceId);
         profile.put("device", device);
+        Long modelVersionId = longOrNull(device.get("model_version_id"));
+        profile.put("modelAttributes", modelVersionId == null ? List.of() : jdbcTemplate.queryForList("""
+                SELECT a.id AS attribute_id,a.attribute_code,a.attribute_name,a.data_type,a.usage_type,a.unit,a.allow_override,
+                       COALESCE(o.value_text,v.attribute_value,a.default_value) AS template_value,
+                       COALESCE(o.value_text,v.attribute_value,a.default_value) AS attribute_value,
+                       0 AS device_overridden,g.group_name
+                FROM dev_attribute_definition a
+                JOIN dev_attribute_group g ON g.id=a.group_id
+                LEFT JOIN dev_model_attribute_value v ON v.attribute_id=a.id AND v.model_version_id=?
+                LEFT JOIN dev_attribute_value_option o ON o.id=v.attribute_value_option_id
+                WHERE a.enabled=1 AND a.value_mode='FIXED' AND (a.category_id IS NULL OR a.category_id=?)
+                ORDER BY g.sort,g.id,a.sort,a.id
+                """, modelVersionId, longOrNull(device.get("catalog_category_id"))));
         Long deviceTypeId = longOrNull(device.get("device_type_id"));
-        profile.put("points", deviceTypePoints(deviceTypeId == null ? 0L : deviceTypeId));
-        profile.put("realtime", remoteServiceClient.getData("/api/data/realtime/devices/" + deviceId));
+        Map<String, Object> pointProfile = deviceTypePoints(deviceTypeId == null ? 0L : deviceTypeId);
+        profile.put("points", pointProfile);
+        Map<String, Object> rawRealtime = remoteServiceClient.getData("/api/data/realtime/devices/" + deviceId);
+        profile.put("realtimeRaw", rawRealtime);
+        profile.put("realtime", normalizeRealtime(rawRealtime,
+                castRows(pointProfile.get("definitions")), castRows(pointProfile.get("mappings"))));
         profile.put("latestStats", jdbcTemplate.queryForList("""
                 SELECT *
                 FROM stats_daily_point
@@ -239,6 +266,16 @@ public class PlatformBusinessQueryService {
         profile.put("org", single("SELECT * FROM dev_org WHERE id = ?", orgId));
         profile.put("deviceCount", countDevicesByOrg(orgId));
         profile.put("gatewayCount", countGatewaysByOrg(orgId));
+        List<Object> spaceArgs = new ArrayList<>();
+        String spaceScope = accessService.orgFilterSql("org_id", orgId, true, spaceArgs);
+        profile.put("spaceCount", queryLong("SELECT COUNT(*) FROM park_space WHERE 1 = 1" + spaceScope, spaceArgs));
+        List<Object> contractArgs = new ArrayList<>();
+        String contractScope = accessService.orgFilterSql("c.org_id", orgId, true, contractArgs);
+        profile.put("activeContractCount", queryLong("SELECT COUNT(*) FROM leasing_contract c WHERE c.status = 'ACTIVE'" + contractScope, contractArgs));
+        List<Object> tenantArgs = new ArrayList<>();
+        String tenantScope = accessService.orgFilterSql("c.org_id", orgId, true, tenantArgs);
+        profile.put("tenantCount", queryLong("SELECT COUNT(DISTINCT c.tenant_id) FROM leasing_contract c WHERE c.status = 'ACTIVE'" + tenantScope, tenantArgs));
+        profile.put("spaces", jdbcTemplate.queryForList("SELECT * FROM park_space WHERE 1 = 1" + spaceScope + " ORDER BY space_type, space_code LIMIT 30", spaceArgs.toArray()));
         List<Object> onlineGatewayArgs = new ArrayList<>();
         String onlineGatewayScope = accessService.orgFilterSql("org_id", orgId, true, onlineGatewayArgs);
         profile.put("onlineGatewayCount", queryLong("""
@@ -258,6 +295,9 @@ public class PlatformBusinessQueryService {
                 "deviceCount", profile.get("deviceCount"),
                 "gatewayCount", profile.get("gatewayCount"),
                 "onlineGatewayCount", profile.get("onlineGatewayCount"),
+                "spaceCount", profile.get("spaceCount"),
+                "tenantCount", profile.get("tenantCount"),
+                "activeContractCount", profile.get("activeContractCount"),
                 "alarmCount", recentAlarms.size(),
                 "alarmTrendCount", alarmTrend.size(),
                 "energyTrendCount", energyTrend.size(),
@@ -307,7 +347,9 @@ public class PlatformBusinessQueryService {
                 ORDER BY sort, id
                 """, typeId);
         data.put("definitions", definitions);
-        ensureDefaultPointMappings(typeId, definitions);
+        if (deviceCatalogService.isDeviceTypeWritable(typeId)) {
+            ensureDefaultPointMappings(typeId, definitions);
+        }
         data.put("mappings", jdbcTemplate.queryForList("""
                 SELECT *
                 FROM dev_point_mapping
@@ -398,6 +440,7 @@ public class PlatformBusinessQueryService {
         if (singleOrNull("SELECT * FROM dev_device_type WHERE id = ?", typeId) == null) {
             throw new BusinessException(404, "设备类型不存在: " + typeId);
         }
+        deviceCatalogService.assertDeviceTypeWritable(typeId);
         List<Map<String, Object>> definitions = request.get("definitions") instanceof List<?> list
                 ? list.stream().filter(Map.class::isInstance).map(item -> (Map<String, Object>) item).toList()
                 : List.of();
@@ -751,6 +794,11 @@ public class PlatformBusinessQueryService {
                     Objects.toString(node.get("device_name"), ""),
                     Objects.toString(node.get("device_sn"), ""),
                     Objects.toString(node.get("type_name"), ""));
+            case "SPACE" -> String.join(" ",
+                    Objects.toString(node.get("space_name"), ""),
+                    Objects.toString(node.get("space_code"), ""),
+                    Objects.toString(node.get("space_type"), ""));
+            case "GROUP" -> Objects.toString(node.get("group_name"), "");
             default -> String.join(" ",
                     Objects.toString(node.get("org_name"), ""));
         };
@@ -940,6 +988,104 @@ public class PlatformBusinessQueryService {
             sql.append(" AND ").append(column).append(" <= ?");
             args.add(end.trim());
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> castRows(Object value) {
+        if (!(value instanceof List<?> rows)) return List.of();
+        return rows.stream().filter(Map.class::isInstance).map(row -> (Map<String, Object>) row).toList();
+    }
+
+    private Map<String, Object> normalizeRealtime(Map<String, Object> raw, List<Map<String, Object>> definitions,
+                                                   List<Map<String, Object>> mappings) {
+        Map<String, Map<String, Object>> mappingByCode = new LinkedHashMap<>();
+        for (Map<String, Object> mapping : mappings) mappingByCode.put(text(mapping, "point_code", "pointCode"), mapping);
+        JsonNode root = objectMapper.valueToTree(raw == null ? Map.of() : raw);
+        JsonNode payload = unwrapRealtimePayload(root);
+        List<Map<String, Object>> points = new ArrayList<>();
+        for (Map<String, Object> definition : definitions) {
+            String code = text(definition, "point_code", "pointCode");
+            Map<String, Object> mapping = mappingByCode.get(code);
+            Object rawValue = readMappedValue(payload, mapping, code);
+            Map<String, Object> point = new LinkedHashMap<>();
+            point.put("pointCode", code);
+            point.put("pointName", text(definition, "point_name", "pointName"));
+            point.put("unit", text(definition, "unit"));
+            point.put("dataType", text(definition, "data_type", "dataType"));
+            point.put("businessRole", text(definition, "business_role", "businessRole"));
+            point.put("sourcePath", mapping == null ? null : text(mapping, "source_path", "sourcePath"));
+            point.put("value", applyPointTransform(rawValue, mapping));
+            points.add(point);
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("available", !points.isEmpty());
+        result.put("collectTime", firstText(raw, "collectTime", "collect_time", "timestamp"));
+        result.put("points", points);
+        return result;
+    }
+
+    private JsonNode unwrapRealtimePayload(JsonNode node) {
+        JsonNode current = node;
+        while (current != null && current.isObject() && current.has("data") && current.get("data").isObject()) current = current.get("data");
+        return current == null ? objectMapper.createObjectNode() : current;
+    }
+
+    private Object readMappedValue(JsonNode payload, Map<String, Object> mapping, String pointCode) {
+        if (mapping != null) {
+            String path = text(mapping, "source_path", "sourcePath");
+            JsonNode byPath = readJsonPath(payload, path);
+            if (byPath != null) return jsonValue(byPath);
+        }
+        JsonNode direct = payload.path("points").path(pointCode);
+        if (direct.isMissingNode() || direct.isNull()) direct = payload.path(pointCode);
+        if (direct.isMissingNode() || direct.isNull()) direct = payload.path(toCamel(pointCode));
+        return direct.isMissingNode() || direct.isNull() ? null : jsonValue(direct);
+    }
+
+    private JsonNode readJsonPath(JsonNode root, String path) {
+        if (path == null || path.isBlank() || !path.startsWith("$")) return null;
+        JsonNode current = root;
+        String normalized = path.startsWith("$.") ? path.substring(2) : path.substring(1);
+        if (normalized.isBlank()) return current;
+        for (String segment : normalized.split("\\.")) {
+            current = current == null ? null : current.path(segment);
+            if (current == null || current.isMissingNode() || current.isNull()) return null;
+        }
+        return current;
+    }
+
+    private Object jsonValue(JsonNode node) {
+        if (node.isBoolean()) return node.booleanValue();
+        if (node.isNumber()) return node.decimalValue();
+        return node.asText();
+    }
+
+    private Object applyPointTransform(Object raw, Map<String, Object> mapping) {
+        if (raw == null || mapping == null || raw instanceof Boolean) return raw;
+        try {
+            BigDecimal value = new BigDecimal(raw.toString());
+            BigDecimal scale = decimalOrDefault(mapping, BigDecimal.ONE, "scale_factor", "scaleFactor");
+            BigDecimal offset = decimalOrDefault(mapping, BigDecimal.ZERO, "offset_value", "offsetValue");
+            return value.multiply(scale).add(offset);
+        } catch (NumberFormatException ex) {
+            return raw;
+        }
+    }
+
+    private String firstText(Map<String, Object> value, String... keys) {
+        for (String key : keys) if (value != null && value.get(key) != null) return value.get(key).toString();
+        return null;
+    }
+
+    private String toCamel(String value) {
+        StringBuilder result = new StringBuilder();
+        boolean uppercase = false;
+        for (char c : value.toCharArray()) {
+            if (c == '_') { uppercase = true; continue; }
+            result.append(uppercase ? Character.toUpperCase(c) : Character.toLowerCase(c));
+            uppercase = false;
+        }
+        return result.toString();
     }
 
     private Map<String, Object> single(String sql, Object... args) {

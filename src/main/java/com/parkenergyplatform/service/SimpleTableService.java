@@ -2,6 +2,7 @@ package com.parkenergyplatform.service;
 
 import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -30,14 +31,19 @@ public class SimpleTableService {
     private final ObjectMapper objectMapper;
     private final DataScopeService dataScopeService;
     private final BusinessDataAccessService accessService;
+    private final DeviceCatalogService deviceCatalogService;
+    private final DeviceProvisionService deviceProvisionService;
 
     public SimpleTableService(JdbcTemplate jdbcTemplate, TableRegistry tableRegistry, ObjectMapper objectMapper,
-                              DataScopeService dataScopeService, BusinessDataAccessService accessService) {
+                              DataScopeService dataScopeService, BusinessDataAccessService accessService,
+                              DeviceCatalogService deviceCatalogService, DeviceProvisionService deviceProvisionService) {
         this.jdbcTemplate = jdbcTemplate;
         this.tableRegistry = tableRegistry;
         this.objectMapper = objectMapper;
         this.dataScopeService = dataScopeService;
         this.accessService = accessService;
+        this.deviceCatalogService = deviceCatalogService;
+        this.deviceProvisionService = deviceProvisionService;
     }
 
     public PageResult<Map<String, Object>> page(String resource, Map<String, String> params) {
@@ -69,9 +75,15 @@ public class SimpleTableService {
 
     @Transactional
     public Map<String, Object> create(String resource, Map<String, Object> body) {
+        if ("devices".equals(resource)) {
+            throw new BusinessException("新设备必须从设备档案选择已发布型号创建，不能通过通用表单绕过产品目录");
+        }
         TableDefinition definition = tableRegistry.get(resource);
         Map<String, Object> values = writableValues(definition, body, false);
         applyDefaultDeviceOrg(definition, values);
+        applyDefaultCollectionPolicy(definition, values);
+        validateDeviceCollectionPolicy(definition, values);
+        assertCatalogResourceWritable(resource, null, values);
         if (values.isEmpty()) {
             throw new BusinessException("没有可保存字段");
         }
@@ -100,8 +112,48 @@ public class SimpleTableService {
     @Transactional
     public Map<String, Object> update(String resource, long id, Map<String, Object> body) {
         TableDefinition definition = tableRegistry.get(resource);
-        get(resource, id);
+        Map<String, Object> current = get(resource, id);
+        if ("devices".equals(resource)) {
+            throw new BusinessException("设备档案必须通过设备上下文接口修改，不能通过通用表单绕过部署和计量校验");
+        }
+        assertCatalogResourceWritable(resource, id, current);
         Map<String, Object> values = writableValues(definition, body, true);
+        if ("devices".equals(resource)) {
+            Long currentTypeId = longOrNull(current.get("device_type_id"));
+            Long requestedTypeId = longOrNull(values.get("device_type_id"));
+            if (requestedTypeId != null && !Objects.equals(currentTypeId, requestedTypeId)) {
+                throw new BusinessException("设备型号不能通过通用编辑修改，请使用产品目录版本变更流程");
+            }
+            Long currentVersionId = longOrNull(current.get("model_version_id"));
+            Long requestedVersionId = longOrNull(values.get("model_version_id"));
+            if (requestedVersionId != null && !Objects.equals(currentVersionId, requestedVersionId)) {
+                throw new BusinessException("设备引用的型号版本不可通过通用编辑修改");
+            }
+            Long currentGatewayId = longOrNull(current.get("gateway_id"));
+            if (values.containsKey("gateway_id") && !Objects.equals(currentGatewayId, longOrNull(values.get("gateway_id")))) {
+                throw new BusinessException("网关部署关系不能通过通用编辑修改，请使用设备部署接口");
+            }
+            if (values.containsKey("protocol_addr")
+                    && !Objects.equals(Objects.toString(current.get("protocol_addr"), ""), Objects.toString(values.get("protocol_addr"), ""))) {
+                throw new BusinessException("协议地址不能通过通用编辑修改，请重新部署设备");
+            }
+            Long spaceId = longOrNull(values.get("space_id"));
+            Long orgId = longOrNull(values.getOrDefault("org_id", current.get("org_id")));
+            if (currentGatewayId != null) {
+                List<Long> gatewayOrgs = jdbcTemplate.queryForList("SELECT org_id FROM dev_gateway WHERE id=?", Long.class, currentGatewayId);
+                if (gatewayOrgs.isEmpty() || !Objects.equals(gatewayOrgs.get(0), orgId)) {
+                    throw new BusinessException("已部署设备不能改到网关之外的组织，请先解绑设备");
+                }
+            }
+            if (spaceId != null) {
+                List<Long> spaceOrgs = jdbcTemplate.queryForList("SELECT org_id FROM park_space WHERE id=? AND status<>'DISABLED'", Long.class, spaceId);
+                if (spaceOrgs.isEmpty() || !Objects.equals(spaceOrgs.get(0), orgId)) {
+                    throw new BusinessException("安装空间必须属于设备管理组织且处于可用状态");
+                }
+            }
+        }
+        assertCatalogResourceWritable(resource, id, values);
+        validateDeviceCollectionPolicy(definition, values);
         checkWritableDataScope(definition, values);
         if (values.isEmpty()) {
             return get(resource, id);
@@ -120,9 +172,20 @@ public class SimpleTableService {
     @Transactional
     public void delete(String resource, long id) {
         TableDefinition definition = tableRegistry.get(resource);
-        get(resource, id);
+        Map<String, Object> current = get(resource, id);
+        assertCatalogResourceWritable(resource, id, current);
         assertDeleteChain(resource, id);
         jdbcTemplate.update("DELETE FROM " + definition.table() + " WHERE id = ?", id);
+    }
+
+    private void assertCatalogResourceWritable(String resource, Long id, Map<String, Object> values) {
+        if ("device-types".equals(resource)) {
+            if (id != null) deviceCatalogService.assertDeviceTypeWritable(id);
+            return;
+        }
+        if (!Set.of("point-definitions", "point-mappings").contains(resource)) return;
+        Long deviceTypeId = longOrNull(values.get("device_type_id"));
+        if (deviceTypeId != null) deviceCatalogService.assertDeviceTypeWritable(deviceTypeId);
     }
 
     @Transactional
@@ -137,6 +200,7 @@ public class SimpleTableService {
             values.put("gateway_sn", uniqueCopyCode(Objects.toString(current.get("gateway_sn"), "GW"), id));
         } else if ("devices".equals(resource)) {
             values.put("device_sn", uniqueCopyCode(Objects.toString(current.get("device_sn"), "DEV"), id));
+            values.put("quality_gate_start_date", LocalDate.now());
         }
         return create(resource, values);
     }
@@ -151,7 +215,10 @@ public class SimpleTableService {
             throw new BusinessException("请选择需要绑定的设备");
         }
         for (Long deviceId : ids) {
-            Map<String, Object> device = single("SELECT id, org_id, gateway_id FROM dev_device WHERE id = ?", deviceId);
+            Map<String, Object> device = single("""
+                    SELECT d.id,d.org_id,d.gateway_id,d.protocol_addr,t.protocol_type
+                    FROM dev_device d JOIN dev_device_type t ON t.id=d.device_type_id WHERE d.id=?
+                    """, deviceId);
             Long currentOrgId = longOrNull(device.get("org_id"));
             if (currentOrgId != null) {
                 assertOrgAccess(currentOrgId);
@@ -160,7 +227,17 @@ public class SimpleTableService {
             if (currentGatewayId != null && !Objects.equals(currentGatewayId, gatewayId)) {
                 accessService.assertGatewayAccess(currentGatewayId);
             }
-            jdbcTemplate.update("UPDATE dev_device SET gateway_id = ?, org_id = ? WHERE id = ?", gatewayId, orgId, deviceId);
+            if (!Objects.equals(currentOrgId, orgId)) {
+                throw new BusinessException("批量绑定不能改变设备管理组织，请先在设备档案调整组织归属");
+            }
+            if (Objects.toString(device.get("protocol_type"), "").toUpperCase(Locale.ROOT).startsWith("MODBUS")
+                    && Objects.toString(device.get("protocol_addr"), "").isBlank()) {
+                throw new BusinessException("MODBUS 设备必须在设备档案中填写从站地址后单独部署");
+            }
+            deviceProvisionService.deploy(deviceId, Map.of(
+                    "gatewayId", gatewayId,
+                    "protocolAddr", Objects.toString(device.get("protocol_addr"), ""),
+                    "remark", "从接入拓扑树批量绑定"));
         }
         String placeholders = placeholders(ids.size());
         List<Object> args = new ArrayList<>(ids);
@@ -194,6 +271,15 @@ public class SimpleTableService {
                     throw new BusinessException("该网关下存在设备，请先删除设备");
                 }
             }
+            case "devices" -> {
+                if (count("SELECT COUNT(*) FROM log_alarm WHERE device_id = ?", id) > 0
+                        || count("SELECT COUNT(*) FROM command_record WHERE target_type = 'DEVICE' AND target_id = ?", id) > 0
+                        || count("SELECT COUNT(*) FROM ops_work_order WHERE device_id = ?", id) > 0
+                        || count("SELECT COUNT(*) FROM billing_bill_detail WHERE device_id = ?", id) > 0
+                        || count("SELECT COUNT(*) FROM billing_meter_change_order WHERE source_device_id = ? OR target_device_id = ?", id, id) > 0) {
+                    throw new BusinessException("设备已有告警、指令、工单、账单或计量变更记录，不能删除；请改为停用设备");
+                }
+            }
             default -> {
             }
         }
@@ -201,6 +287,11 @@ public class SimpleTableService {
 
     private long count(String sql, long id) {
         Long value = jdbcTemplate.queryForObject(sql, Long.class, id);
+        return value == null ? 0L : value;
+    }
+
+    private long count(String sql, long firstId, long secondId) {
+        Long value = jdbcTemplate.queryForObject(sql, Long.class, firstId, secondId);
         return value == null ? 0L : value;
     }
 
@@ -259,6 +350,33 @@ public class SimpleTableService {
         List<Long> orgIds = jdbcTemplate.queryForList("SELECT id FROM dev_org ORDER BY parent_id, sort, id LIMIT 1", Long.class);
         if (!orgIds.isEmpty()) {
             values.put("org_id", orgIds.get(0));
+        }
+    }
+
+    private void applyDefaultCollectionPolicy(TableDefinition definition, Map<String, Object> values) {
+        if (!"devices".equals(definition.resource())) return;
+        values.putIfAbsent("collect_interval_seconds", 300);
+        values.putIfAbsent("quality_threshold_pct", java.math.BigDecimal.valueOf(95));
+        values.putIfAbsent("quality_gate_start_date", LocalDate.now());
+    }
+
+    private void validateDeviceCollectionPolicy(TableDefinition definition, Map<String, Object> values) {
+        if (!"devices".equals(definition.resource())) return;
+        if (values.containsKey("collect_interval_seconds")) {
+            Long interval = longOrNull(values.get("collect_interval_seconds"));
+            if (interval == null || interval < 10 || interval > 86_400) {
+                throw new BusinessException("采集周期必须在 10 至 86400 秒之间");
+            }
+        }
+        if (values.containsKey("quality_threshold_pct")) {
+            try {
+                java.math.BigDecimal threshold = new java.math.BigDecimal(String.valueOf(values.get("quality_threshold_pct")));
+                if (threshold.compareTo(java.math.BigDecimal.ONE) < 0 || threshold.compareTo(java.math.BigDecimal.valueOf(100)) > 0) {
+                    throw new BusinessException("日结算最低完整率必须在 1 至 100 之间");
+                }
+            } catch (NumberFormatException exception) {
+                throw new BusinessException("日结算最低完整率格式不正确");
+            }
         }
     }
 

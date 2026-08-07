@@ -5,9 +5,9 @@ spring:
   application:
     name: park-energy-platform
   datasource:
-    url: ${PARK_DB_URL:jdbc:mysql://localhost:3306/park_energy_system?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true}
-    username: root
-    password: 123456
+    url: ${PARK_DB_URL:jdbc:mysql://115.159.222.238:3306/park_energy_system?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true}
+    username: admin
+    password: 'Saki#Mygo06'
     driver-class-name: com.mysql.cj.jdbc.Driver
 
 park:
