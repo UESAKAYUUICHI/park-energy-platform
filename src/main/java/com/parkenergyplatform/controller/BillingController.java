@@ -6,6 +6,7 @@ import cn.dev33.satoken.annotation.SaCheckPermission;
 import com.parkenergyplatform.aop.OperationLog;
 import com.parkenergyplatform.common.ApiResponse;
 import com.parkenergyplatform.common.PageResult;
+import com.parkenergyplatform.service.BillingCollectionService;
 import com.parkenergyplatform.service.BillingService;
 import com.parkenergyplatform.service.SimpleTableService;
 import jakarta.servlet.http.HttpServletRequest;
@@ -22,10 +23,12 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/api/platform/billing")
 public class BillingController {
     private final BillingService billingService;
+    private final BillingCollectionService collectionService;
     private final SimpleTableService tableService;
 
-    public BillingController(BillingService billingService, SimpleTableService tableService) {
+    public BillingController(BillingService billingService, BillingCollectionService collectionService, SimpleTableService tableService) {
         this.billingService = billingService;
+        this.collectionService = collectionService;
         this.tableService = tableService;
     }
 
@@ -59,6 +62,32 @@ public class BillingController {
     @OperationLog(module = "计费管理", operation = "账单缴费")
     public ApiResponse<Map<String, Object>> pay(@PathVariable long billId, @RequestBody Map<String, Object> request) {
         return ApiResponse.success(billingService.pay(billId, request));
+    }
+
+    @PostMapping("/payments/{paymentId}/reverse")
+    @SaCheckPermission("billing:payment:reverse")
+    @OperationLog(module = "计费管理", operation = "收款冲销退款")
+    public ApiResponse<Map<String, Object>> reversePayment(@PathVariable long paymentId, @RequestBody Map<String, Object> request) {
+        return ApiResponse.success(billingService.reversePayment(paymentId, request));
+    }
+
+    @GetMapping("/collections/overdue")
+    @SaCheckPermission("billing:collection:list")
+    public ApiResponse<PageResult<Map<String, Object>>> overdue(HttpServletRequest request) {
+        return ApiResponse.success(collectionService.overdue(queryParams(request)));
+    }
+
+    @GetMapping("/bills/{billId}/collections")
+    @SaCheckPermission("billing:bill:list")
+    public ApiResponse<java.util.List<Map<String, Object>>> collections(@PathVariable long billId) {
+        return ApiResponse.success(collectionService.records(billId));
+    }
+
+    @PostMapping("/bills/{billId}/collections")
+    @SaCheckPermission("billing:collection:edit")
+    @OperationLog(module = "计费管理", operation = "账单催缴登记")
+    public ApiResponse<Map<String, Object>> createCollection(@PathVariable long billId, @RequestBody Map<String, Object> request) {
+        return ApiResponse.success(collectionService.create(billId, request));
     }
 
     @PostMapping("/bills/{billId}/recalculate")

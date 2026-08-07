@@ -8,6 +8,7 @@ import com.parkenergyplatform.aop.OperationLog;
 import com.parkenergyplatform.common.ApiResponse;
 import com.parkenergyplatform.common.PageResult;
 import com.parkenergyplatform.service.AlarmService;
+import com.parkenergyplatform.service.OperationsService;
 import com.parkenergyplatform.service.PlatformBusinessQueryService;
 import com.parkenergyplatform.service.SimpleTableService;
 import jakarta.servlet.http.HttpServletRequest;
@@ -25,12 +26,14 @@ public class AlarmManageController {
     private final AlarmService alarmService;
     private final SimpleTableService tableService;
     private final PlatformBusinessQueryService queryService;
+    private final OperationsService operationsService;
 
     public AlarmManageController(AlarmService alarmService, SimpleTableService tableService,
-                                 PlatformBusinessQueryService queryService) {
+                                 PlatformBusinessQueryService queryService, OperationsService operationsService) {
         this.alarmService = alarmService;
         this.tableService = tableService;
         this.queryService = queryService;
+        this.operationsService = operationsService;
     }
 
     @GetMapping("/rules")
@@ -64,6 +67,13 @@ public class AlarmManageController {
     @OperationLog(module = "告警管理", operation = "处理告警事件")
     public ApiResponse<Map<String, Object>> deal(@PathVariable long alarmId, @RequestBody Map<String, Object> request) {
         return ApiResponse.success(alarmService.deal(alarmId, request));
+    }
+
+    @PostMapping("/events/{alarmId}/work-order")
+    @SaCheckPermission("ops:workorder:create")
+    @OperationLog(module = "告警管理", operation = "告警转运维工单")
+    public ApiResponse<Map<String, Object>> createWorkOrder(@PathVariable long alarmId) {
+        return ApiResponse.success(operationsService.createFromAlarm(alarmId));
     }
 
     @GetMapping("/events")

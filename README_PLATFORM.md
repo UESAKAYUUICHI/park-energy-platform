@@ -7,7 +7,7 @@
 ## 已实现能力
 
 - 基础 Spring Boot Web 工程
-- MySQL 配置：`root / 123456`
+- MySQL 配置：`admin / Saki#Mygo06`
 - 统一返回结构：`ApiResponse`
 - 全局异常处理
 - CORS 配置
@@ -30,8 +30,8 @@ server:
 spring:
   datasource:
     url: jdbc:mysql://localhost:3306/park_energy_system
-    username: root
-    password: 123456
+    username: admin
+    password: 'Saki#Mygo06'
 
 park:
   platform:

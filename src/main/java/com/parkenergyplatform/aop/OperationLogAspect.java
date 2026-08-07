@@ -4,7 +4,10 @@ import java.time.LocalDateTime;
 import java.util.Arrays;
 
 import cn.dev33.satoken.stp.StpUtil;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.parkenergyplatform.entity.OperationLogEntity;
 import com.parkenergyplatform.mapper.OperationLogMapper;
 import jakarta.servlet.http.HttpServletRequest;
@@ -72,10 +75,29 @@ public class OperationLogAspect {
                 .filter(arg -> !(arg instanceof HttpServletResponse))
                 .toArray();
         try {
-            String json = objectMapper.writeValueAsString(filtered);
+            JsonNode jsonNode = objectMapper.valueToTree(filtered);
+            redact(jsonNode);
+            String json = objectMapper.writeValueAsString(jsonNode);
             return json.length() > 1800 ? json.substring(0, 1800) : json;
         } catch (Exception ex) {
             return "[]";
+        }
+    }
+
+    private void redact(JsonNode node) {
+        if (node instanceof ObjectNode objectNode) {
+            objectNode.fieldNames().forEachRemaining(field -> {
+                JsonNode value = objectNode.get(field);
+                if (field.toLowerCase().contains("password")
+                        || field.toLowerCase().contains("token")
+                        || field.toLowerCase().contains("secret")) {
+                    objectNode.put(field, "[REDACTED]");
+                } else {
+                    redact(value);
+                }
+            });
+        } else if (node instanceof ArrayNode arrayNode) {
+            arrayNode.forEach(this::redact);
         }
     }
 

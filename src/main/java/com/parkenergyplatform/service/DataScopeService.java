@@ -47,6 +47,33 @@ public class DataScopeService {
         return user == null ? null : user.getOrgId();
     }
 
+    /**
+     * Resolves the organization that should receive records created without an
+     * explicit organization. The result is the highest ancestor that remains
+     * inside the user's visible scope, rather than an arbitrary first row.
+     */
+    public Long defaultRootOrgId(long userId) {
+        Set<Long> visible = visibleOrgIds(userId);
+        Long current = userOrgId(userId);
+        if (current == null || (visible != null && !visible.contains(current))) {
+            current = visibleRoot(visible);
+        }
+        if (current == null) {
+            return null;
+        }
+
+        Set<Long> visited = new LinkedHashSet<>();
+        while (visited.add(current)) {
+            Long parentId = jdbcTemplate.queryForObject(
+                    "SELECT parent_id FROM dev_org WHERE id = ?", Long.class, current);
+            if (parentId == null || parentId == 0 || (visible != null && !visible.contains(parentId))) {
+                return current;
+            }
+            current = parentId;
+        }
+        return current;
+    }
+
     public List<Map<String, Object>> userOrgScopes(long userId) {
         return jdbcTemplate.queryForList("""
                 SELECT s.id, s.user_id, s.org_id, s.scope_mode, s.create_time,
@@ -173,6 +200,33 @@ public class DataScopeService {
             children.computeIfAbsent(parentId == null ? 0L : parentId, key -> new ArrayList<>()).add(id);
         }
         return children;
+    }
+
+    private Long visibleRoot(Set<Long> visible) {
+        if (visible == null) {
+            List<Long> roots = jdbcTemplate.queryForList(
+                    "SELECT id FROM dev_org WHERE parent_id IS NULL OR parent_id = 0 ORDER BY sort, id LIMIT 1",
+                    Long.class);
+            return roots.isEmpty() ? null : roots.get(0);
+        }
+        if (visible.isEmpty()) {
+            return null;
+        }
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList("SELECT id, parent_id FROM dev_org WHERE id IN (" +
+                placeholders(visible.size()) + ") ORDER BY parent_id, id", visible.toArray());
+        Set<Long> visibleSet = new LinkedHashSet<>(visible);
+        for (Map<String, Object> row : rows) {
+            Long id = longValue(row.get("id"));
+            Long parentId = longValue(row.get("parent_id"));
+            if (id != null && (parentId == null || parentId == 0 || !visibleSet.contains(parentId))) {
+                return id;
+            }
+        }
+        return visible.iterator().next();
+    }
+
+    private String placeholders(int count) {
+        return String.join(",", java.util.Collections.nCopies(count, "?"));
     }
 
     private void expand(Long orgId, Map<Long, List<Long>> children, Set<Long> visible) {

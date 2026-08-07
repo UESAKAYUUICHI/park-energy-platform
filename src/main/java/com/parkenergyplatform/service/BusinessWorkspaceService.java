@@ -257,18 +257,26 @@ public class BusinessWorkspaceService {
 
     private Map<String, Object> metrics(Long rootOrgId) {
         Map<String, Object> metrics = new LinkedHashMap<>();
-        metrics.put("orgCount", countScoped("dev_org", "id", rootOrgId));
-        metrics.put("gatewayCount", countScoped("dev_gateway", "org_id", rootOrgId));
-        metrics.put("onlineGatewayCount", countWhereScoped("dev_gateway", "org_id", "online_status = 1", rootOrgId));
-        metrics.put("deviceCount", countScoped("dev_device", "org_id", rootOrgId));
-        metrics.put("enabledDeviceCount", countWhereScoped("dev_device", "org_id", "status = 1", rootOrgId));
-        metrics.put("pointCount", count("dev_point_definition"));
-        metrics.put("billablePointCount", countWhere("dev_point_definition", "billable = 1"));
-        metrics.put("pendingAlarmCount", countWhereScoped("log_alarm", "org_id", "deal_status = 0", rootOrgId));
-        metrics.put("unpaidBillCount", billingBillCount("b.pay_status = 0", rootOrgId));
-        metrics.put("totalReceivable", billingBillSum("b.pay_status IN (0,2)", rootOrgId));
-        metrics.put("todayUsage", sumScoped("stats_daily_point", "usage_value", "org_id", "stat_date = CURDATE()", rootOrgId));
+        putMetric(metrics, "orgCount", () -> countScoped("dev_org", "id", rootOrgId), 0L);
+        putMetric(metrics, "gatewayCount", () -> countScoped("dev_gateway", "org_id", rootOrgId), 0L);
+        putMetric(metrics, "onlineGatewayCount", () -> countWhereScoped("dev_gateway", "org_id", "online_status = 1", rootOrgId), 0L);
+        putMetric(metrics, "deviceCount", () -> countScoped("dev_device", "org_id", rootOrgId), 0L);
+        putMetric(metrics, "enabledDeviceCount", () -> countWhereScoped("dev_device", "org_id", "status = 1", rootOrgId), 0L);
+        putMetric(metrics, "pointCount", () -> count("dev_point_definition"), 0L);
+        putMetric(metrics, "billablePointCount", () -> countWhere("dev_point_definition", "billable = 1"), 0L);
+        putMetric(metrics, "pendingAlarmCount", () -> countWhereScoped("log_alarm", "org_id", "deal_status = 0", rootOrgId), 0L);
+        putMetric(metrics, "unpaidBillCount", () -> billingBillCount("b.pay_status = 0", rootOrgId), 0L);
+        putMetric(metrics, "totalReceivable", () -> billingBillSum("b.pay_status IN (0,2)", rootOrgId), BigDecimal.ZERO);
+        putMetric(metrics, "todayUsage", () -> sumScoped("stats_daily_point", "usage_value", "org_id", "stat_date = CURDATE()", rootOrgId), BigDecimal.ZERO);
         return metrics;
+    }
+
+    private void putMetric(Map<String, Object> metrics, String key, Supplier<Object> supplier, Object fallback) {
+        try {
+            metrics.put(key, supplier.get());
+        } catch (Exception ex) {
+            metrics.put(key, fallback);
+        }
     }
 
     private List<Map<String, Object>> deviceRows() {
