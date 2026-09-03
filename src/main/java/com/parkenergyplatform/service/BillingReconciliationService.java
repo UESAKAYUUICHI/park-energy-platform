@@ -1,0 +1,48 @@
+package com.parkenergyplatform.service;
+
+import java.math.BigDecimal;
+import java.sql.Date;
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+import com.parkenergyplatform.common.BusinessException;
+import com.parkenergyplatform.common.PageResult;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+/** Links an external statement to existing, successful payments without rewriting the source payment. */
+@Service
+public class BillingReconciliationService {
+    private final JdbcTemplate jdbc; private final BusinessDataAccessService access;
+    public BillingReconciliationService(JdbcTemplate jdbc, BusinessDataAccessService access) { this.jdbc=jdbc;this.access=access; }
+
+    public PageResult<Map<String,Object>> page(Map<String,String> params) {
+        int page=positive(params.get("pageNum"),1), size=Math.min(positive(params.get("pageSize"),20),200); List<Object> args=new ArrayList<>();StringBuilder where=new StringBuilder(" WHERE 1=1");
+        equals(where,args,"r.org_id",params.get("orgId")); equals(where,args,"r.status",params.get("status")); String keyword=text(params.get("keyword")); if(keyword!=null){where.append(" AND r.statement_no LIKE ?");args.add("%"+keyword+"%");}where.append(access.scopeSql("r.org_id",args));String from=" FROM billing_reconciliation_batch r LEFT JOIN dev_org o ON o.id=r.org_id";
+        Long total=jdbc.queryForObject("SELECT COUNT(*)"+from+where,Long.class,args.toArray());List<Object> pageArgs=new ArrayList<>(args);pageArgs.add(size);pageArgs.add((page-1)*size);
+        return PageResult.of(jdbc.queryForList("SELECT r.*,o.org_name"+from+where+" ORDER BY r.statement_date DESC,r.id DESC LIMIT ? OFFSET ?",pageArgs.toArray()),total==null?0:total,page,size);
+    }
+
+    @Transactional public Map<String,Object> create(Map<String,Object> body,String operator) {
+        long org=number(body.get("orgId"),"orgId");assertOrg(org);String statementNo=required(body.get("statementNo"),"statementNo");Long exists=jdbc.queryForObject("SELECT COUNT(*) FROM billing_reconciliation_batch WHERE statement_no=?",Long.class,statementNo);if(exists!=null&&exists>0)throw new BusinessException(409,"对账单号已存在");
+        jdbc.update("INSERT INTO billing_reconciliation_batch (statement_no,org_id,channel,statement_date,statement_amount,remark,create_by,update_by) VALUES (?,?,?,?,?,?,?,?)",statementNo,org,textOr(body.get("channel"),"OFFLINE"),Date.valueOf(required(body.get("statementDate"),"statementDate")),amount(body.get("statementAmount")),text(body.get("remark")),operator,operator);Long id=jdbc.queryForObject("SELECT id FROM billing_reconciliation_batch WHERE statement_no=?",Long.class,statementNo);return detail(id==null?0:id);
+    }
+    public Map<String,Object> detail(long id){Map<String,Object> batch=batch(id,false);assertOrg(number(batch.get("org_id"),"orgId"));batch.put("items",jdbc.queryForList("SELECT i.*,p.payment_no,b.bill_no FROM billing_reconciliation_item i LEFT JOIN billing_payment p ON p.id=i.matched_payment_id LEFT JOIN billing_bill b ON b.id=i.matched_bill_id WHERE i.reconciliation_batch_id=? ORDER BY i.received_time DESC,i.id DESC",id));return batch;}
+    @Transactional public Map<String,Object> addItem(long batchId,Map<String,Object> body,String operator){Map<String,Object> batch=batch(batchId,true);assertDraft(batch);String ref=text(body.get("bankReference"));if(ref!=null){Long exists=jdbc.queryForObject("SELECT COUNT(*) FROM billing_reconciliation_item WHERE reconciliation_batch_id=? AND bank_reference=?",Long.class,batchId,ref);if(exists!=null&&exists>0)throw new BusinessException(409,"该流水号已在此对账单中录入");}jdbc.update("INSERT INTO billing_reconciliation_item (reconciliation_batch_id,bank_reference,payer_name,received_amount,received_time,create_by,update_by) VALUES (?,?,?,?,?,?,?)",batchId,ref,text(body.get("payerName")),amount(body.get("receivedAmount")),Timestamp.valueOf(LocalDateTime.parse(required(body.get("receivedTime"),"receivedTime").replace("Z",""))),operator,operator);refresh(batchId);return detail(batchId);}
+    public List<Map<String,Object>> candidates(long itemId){Map<String,Object> item=item(itemId);Map<String,Object> batch=batch(number(item.get("reconciliation_batch_id"),"batchId"),false);assertOrg(number(batch.get("org_id"),"orgId"));return jdbc.queryForList("""
+            SELECT p.id,p.payment_no,p.pay_amount,p.pay_time,p.pay_way,b.bill_no,a.account_name
+            FROM billing_payment p JOIN billing_bill b ON b.id=p.bill_id JOIN billing_account a ON a.id=b.account_id
+            WHERE a.org_id=? AND p.payment_status='SUCCESS' AND NOT EXISTS (SELECT 1 FROM billing_reconciliation_item i WHERE i.matched_payment_id=p.id)
+              AND ABS(p.pay_amount-?)<0.01 ORDER BY ABS(TIMESTAMPDIFF(HOUR,p.pay_time,?)),p.id DESC LIMIT 20
+            """,batch.get("org_id"),item.get("received_amount"),item.get("received_time"));}
+    @Transactional public Map<String,Object> match(long itemId,long paymentId,String operator){Map<String,Object> item=item(itemId);Map<String,Object> batch=batch(number(item.get("reconciliation_batch_id"),"batchId"),true);assertDraft(batch);List<Map<String,Object>> payments=jdbc.queryForList("SELECT p.*,b.id bill_id,a.org_id FROM billing_payment p JOIN billing_bill b ON b.id=p.bill_id JOIN billing_account a ON a.id=b.account_id WHERE p.id=? AND p.payment_status='SUCCESS' FOR UPDATE",paymentId);if(payments.isEmpty())throw new BusinessException("成功收款不存在");Map<String,Object> payment=payments.get(0);if(number(payment.get("org_id"),"orgId")!=number(batch.get("org_id"),"orgId"))throw new BusinessException("收款与对账单不属于同一园区");if(amount(payment.get("pay_amount")).subtract(amount(item.get("received_amount"))).abs().compareTo(new BigDecimal("0.01"))>=0)throw new BusinessException("收款金额与对账流水金额不一致，请标记差异");jdbc.update("UPDATE billing_reconciliation_item SET matched_payment_id=?,matched_bill_id=?,status='MATCHED',difference_reason=NULL,matched_by=?,matched_time=NOW(),update_by=? WHERE id=?",paymentId,payment.get("bill_id"),operator,operator,itemId);refresh(number(batch.get("id"),"batchId"));return detail(number(batch.get("id"),"batchId"));}
+    @Transactional public Map<String,Object> difference(long itemId,String reason,String operator){Map<String,Object> item=item(itemId);Map<String,Object> batch=batch(number(item.get("reconciliation_batch_id"),"batchId"),true);assertDraft(batch);if(text(reason)==null)throw new BusinessException("差异必须填写原因");jdbc.update("UPDATE billing_reconciliation_item SET status='DIFFERENCE',difference_reason=?,matched_by=?,matched_time=NOW(),update_by=? WHERE id=?",reason,operator,operator,itemId);refresh(number(batch.get("id"),"batchId"));return detail(number(batch.get("id"),"batchId"));}
+    @Transactional public Map<String,Object> finish(long id,String operator){Map<String,Object> batch=batch(id,true);assertDraft(batch);Long pending=jdbc.queryForObject("SELECT COUNT(*) FROM billing_reconciliation_item WHERE reconciliation_batch_id=? AND status='PENDING'",Long.class,id);if(pending!=null&&pending>0)throw new BusinessException("仍有 "+pending+" 条待处理流水；请匹配或标记差异后完成对账");refresh(id);jdbc.update("UPDATE billing_reconciliation_batch SET status='RECONCILED',reconciled_by=?,reconciled_time=NOW(),update_by=? WHERE id=?",operator,operator,id);return detail(id);}
+    private void refresh(long id){jdbc.update("UPDATE billing_reconciliation_batch b SET record_count=(SELECT COUNT(*) FROM billing_reconciliation_item i WHERE i.reconciliation_batch_id=b.id),matched_count=(SELECT COUNT(*) FROM billing_reconciliation_item i WHERE i.reconciliation_batch_id=b.id AND i.status='MATCHED'),difference_count=(SELECT COUNT(*) FROM billing_reconciliation_item i WHERE i.reconciliation_batch_id=b.id AND i.status='DIFFERENCE') WHERE b.id=?",id);}
+    private Map<String,Object> batch(long id,boolean locked){List<Map<String,Object>> rows=jdbc.queryForList("SELECT * FROM billing_reconciliation_batch WHERE id=?"+(locked?" FOR UPDATE":""),id);if(rows.isEmpty())throw new BusinessException(404,"对账批次不存在");return rows.get(0);}private Map<String,Object> item(long id){List<Map<String,Object>> rows=jdbc.queryForList("SELECT * FROM billing_reconciliation_item WHERE id=?",id);if(rows.isEmpty())throw new BusinessException(404,"对账流水不存在");return rows.get(0);}private void assertDraft(Map<String,Object> batch){assertOrg(number(batch.get("org_id"),"orgId"));if(!"DRAFT".equalsIgnoreCase(String.valueOf(batch.get("status"))))throw new BusinessException("已完成对账单不可修改");}private void assertOrg(long org){if(!access.hasOrgAccess(org))throw new BusinessException(403,"没有该园区财务权限");}private void equals(StringBuilder w,List<Object>a,String f,String v){if(text(v)!=null){w.append(" AND ").append(f).append("=?");a.add(v);}}private int positive(String v,int d){try{int n=Integer.parseInt(v);return n>0?n:d;}catch(Exception e){return d;}}private long number(Object v,String name){try{return Long.parseLong(String.valueOf(v));}catch(Exception e){throw new BusinessException(name+"必须为数字");}}private BigDecimal amount(Object v){try{return new BigDecimal(String.valueOf(v)).setScale(2);}catch(Exception e){throw new BusinessException("金额不合法");}}private String required(Object v,String n){String s=text(v);if(s==null)throw new BusinessException(n+"不能为空");return s;}private String text(Object v){if(v==null)return null;String s=Objects.toString(v,"").trim();return s.isEmpty()?null:s;}private String textOr(Object v,String d){String s=text(v);return s==null?d:s;}
+}

@@ -9,6 +9,7 @@ import com.parkenergyplatform.common.PageResult;
 import com.parkenergyplatform.service.TariffPlanService;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
@@ -49,6 +50,14 @@ public class TariffPlanController {
     @OperationLog(module = "计费管理", operation = "修改园区分时电价方案")
     public ApiResponse<Map<String, Object>> update(@PathVariable long id, @RequestBody Map<String, Object> body) {
         return ApiResponse.success(tariffPlanService.update(id, body));
+    }
+
+    @DeleteMapping("/{id}")
+    @SaCheckPermission("billing:tariff:edit")
+    @OperationLog(module = "计费管理", operation = "删除分时电价方案")
+    public ApiResponse<Void> delete(@PathVariable long id) {
+        tariffPlanService.delete(id);
+        return ApiResponse.success(null);
     }
 
     @PostMapping("/validate")
