@@ -46,6 +46,43 @@ public class AccessProxyController {
         return ApiResponse.success(filterRemoteList(remoteServiceClient.getAccess("/api/access/raw-messages"), "gateway"));
     }
 
+    @GetMapping("/raw-messages/{rawLogId}")
+    @SaCheckPermission("access:view")
+    public ApiResponse<Map<String, Object>> rawMessage(@PathVariable long rawLogId) {
+        return ApiResponse.success(authorizedGatewayDetail(remoteServiceClient.getAccess("/api/access/raw-messages/" + rawLogId)));
+    }
+
+    @PostMapping("/raw-messages/{rawLogId}/replay")
+    @SaCheckPermission(value = {"archive:device:deploy", "archive:edit"}, mode = cn.dev33.satoken.annotation.SaMode.OR)
+    @OperationLog(module = "接入管理", operation = "重放接入原始报文")
+    public ApiResponse<Map<String, Object>> replayRawMessage(@PathVariable long rawLogId) {
+        authorizedGatewayDetail(remoteServiceClient.getAccess("/api/access/raw-messages/" + rawLogId));
+        return ApiResponse.success(remoteServiceClient.postAccess("/api/access/raw-messages/" + rawLogId + "/replay", Map.of()));
+    }
+
+    @GetMapping("/discovered-devices")
+    @SaCheckPermission("access:view")
+    public ApiResponse<Map<String, Object>> discoveredDevices() {
+        return ApiResponse.success(filterRemoteList(remoteServiceClient.getAccess("/api/access/discovered-devices"), "gateway"));
+    }
+
+    @GetMapping("/discovered-devices/{id}")
+    @SaCheckPermission("access:view")
+    public ApiResponse<Map<String, Object>> discoveredDevice(@PathVariable long id) {
+        return ApiResponse.success(authorizedGatewayDetail(remoteServiceClient.getAccess("/api/access/discovered-devices/" + id)));
+    }
+
+    @PostMapping("/discovered-devices/{id}/bind")
+    @SaCheckPermission(value = {"archive:device:deploy", "archive:edit"}, mode = cn.dev33.satoken.annotation.SaMode.OR)
+    @OperationLog(module = "接入管理", operation = "绑定待接入设备")
+    public ApiResponse<Map<String, Object>> bindDiscoveredDevice(@PathVariable long id, @RequestBody Map<String, Object> body) {
+        authorizedGatewayDetail(remoteServiceClient.getAccess("/api/access/discovered-devices/" + id));
+        Object deviceId = body.get("deviceId");
+        if (deviceId == null) throw new com.parkenergyplatform.common.BusinessException("deviceId 不能为空");
+        accessService.assertDeviceAccess(Long.valueOf(String.valueOf(deviceId)));
+        return ApiResponse.success(remoteServiceClient.postAccess("/api/access/discovered-devices/" + id + "/bind", body));
+    }
+
     @PostMapping("/commands")
     @SaCheckPermission("access:command")
     @OperationLog(module = "接入管理", operation = "发送网关指令")
@@ -105,6 +142,21 @@ public class AccessProxyController {
             filtered.put("data", accessService.filterByGatewayAccess(rows));
         }
         return filtered;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> authorizedGatewayDetail(Map<String, Object> response) {
+        Object data = response.get("data");
+        if (!(data instanceof Map<?, ?> row)) {
+            return response;
+        }
+        Map<String, Object> detail = new LinkedHashMap<>((Map<String, Object>) row);
+        if (!accessService.hasGatewayAccess(accessService.longOrNull(detail.get("gatewayId")))) {
+            throw new com.parkenergyplatform.common.BusinessException(403, "没有该网关的数据访问权限");
+        }
+        Map<String, Object> result = new LinkedHashMap<>(response);
+        result.put("data", detail);
+        return result;
     }
 
     private Map<String, String> queryParams(HttpServletRequest request) {

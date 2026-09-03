@@ -14,11 +14,15 @@ import com.parkenergyplatform.common.ApiResponse;
 import com.parkenergyplatform.common.BusinessException;
 import com.parkenergyplatform.service.BusinessDataAccessService;
 import com.parkenergyplatform.service.PlatformBusinessQueryService;
+import com.parkenergyplatform.service.EnergyEfficiencyService;
 import com.parkenergyplatform.service.RemoteServiceClient;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -29,20 +33,43 @@ public class EnergyProxyController {
     private final BusinessDataAccessService accessService;
     private final PlatformBusinessQueryService queryService;
     private final JdbcTemplate jdbcTemplate;
+    private final EnergyEfficiencyService efficiencyService;
 
     public EnergyProxyController(RemoteServiceClient remoteServiceClient, BusinessDataAccessService accessService,
-                                 PlatformBusinessQueryService queryService, JdbcTemplate jdbcTemplate) {
+                                 PlatformBusinessQueryService queryService, JdbcTemplate jdbcTemplate,
+                                 EnergyEfficiencyService efficiencyService) {
         this.remoteServiceClient = remoteServiceClient;
         this.accessService = accessService;
         this.queryService = queryService;
         this.jdbcTemplate = jdbcTemplate;
+        this.efficiencyService = efficiencyService;
+    }
+
+    /** Resolves the external device SN only after applying the caller's organization data scope. */
+    @GetMapping("/devices/resolve")
+    @SaCheckPermission("energy:view")
+    public ApiResponse<Map<String, Object>> resolveDeviceBySn(@RequestParam String deviceSn) {
+        return ApiResponse.success(authorizedDeviceBySn(deviceSn));
+    }
+
+    @PostMapping("/parse-preview")
+    @SaCheckPermission(value = {"archive:edit", "energy:view"}, mode = cn.dev33.satoken.annotation.SaMode.OR)
+    public ApiResponse<Object> parsePreview(@RequestBody Map<String, Object> body) {
+        Object deviceId = body.get("deviceId");
+        if (deviceId == null) throw new BusinessException("deviceId 不能为空");
+        accessService.assertDeviceAccess(Long.parseLong(String.valueOf(deviceId)));
+        Map<String, Object> response = remoteServiceClient.postData("/api/data/parse-preview", body);
+        if (Boolean.FALSE.equals(response.get("success"))) {
+            throw new BusinessException(String.valueOf(response.getOrDefault("message", "样例报文解析失败")));
+        }
+        return ApiResponse.success(response.get("data"));
     }
 
     @GetMapping("/realtime/devices/{deviceId}")
     @SaCheckPermission("energy:view")
-    public ApiResponse<Map<String, Object>> realtime(@PathVariable Long deviceId) {
+    public ApiResponse<Object> realtime(@PathVariable Long deviceId) {
         accessService.assertDeviceAccess(deviceId);
-        return ApiResponse.success(remoteServiceClient.getData("/api/data/realtime/devices/" + deviceId));
+        return ApiResponse.success(remoteServiceClient.getDataPayload("/api/data/realtime/devices/" + deviceId));
     }
 
     @GetMapping("/realtime/devices")
@@ -73,9 +100,9 @@ public class EnergyProxyController {
 
     @GetMapping("/history")
     @SaCheckPermission("energy:view")
-    public ApiResponse<Map<String, Object>> history(HttpServletRequest request) {
+    public ApiResponse<Object> history(HttpServletRequest request) {
         accessService.assertDeviceAccess(requiredLongParam(request, "deviceId"));
-        return ApiResponse.success(remoteServiceClient.getData("/api/data/history" + queryString(request)));
+        return ApiResponse.success(remoteServiceClient.getDataPayload("/api/data/history" + queryString(request)));
     }
 
     @GetMapping("/history/series")
@@ -103,24 +130,36 @@ public class EnergyProxyController {
         return ApiResponse.success(queryService.energyTrend(queryParams(request)));
     }
 
+    @GetMapping("/drilldown")
+    @SaCheckPermission("energy:view")
+    public ApiResponse<Map<String, Object>> drilldown(HttpServletRequest request) {
+        return ApiResponse.success(queryService.energyDrilldown(queryParams(request)));
+    }
+
+    @GetMapping("/efficiency/overview")
+    @SaCheckPermission("energy:view")
+    public ApiResponse<Map<String, Object>> efficiencyOverview(HttpServletRequest request) {
+        return ApiResponse.success(efficiencyService.overview(queryParams(request)));
+    }
+
     @GetMapping("/statistics/daily")
     @SaCheckPermission("energy:view")
-    public ApiResponse<Map<String, Object>> daily(HttpServletRequest request) {
+    public ApiResponse<Object> daily(HttpServletRequest request) {
         Long deviceId = optionalLongParam(request, "deviceId");
         if (deviceId != null) {
             accessService.assertDeviceAccess(deviceId);
-            return ApiResponse.success(remoteServiceClient.getData("/api/data/statistics/daily" + queryString(request)));
+            return ApiResponse.success(remoteServiceClient.getDataPayload("/api/data/statistics/daily" + queryString(request)));
         }
         return ApiResponse.success(localDailyStats(request));
     }
 
     @GetMapping("/alarms")
     @SaCheckPermission("energy:view")
-    public ApiResponse<Map<String, Object>> alarms(HttpServletRequest request) {
+    public ApiResponse<Object> alarms(HttpServletRequest request) {
         Long deviceId = optionalLongParam(request, "deviceId");
         if (deviceId != null) {
             accessService.assertDeviceAccess(deviceId);
-            return ApiResponse.success(remoteServiceClient.getData("/api/data/alarms" + queryString(request)));
+            return ApiResponse.success(remoteServiceClient.getDataPayload("/api/data/alarms" + queryString(request)));
         }
         return ApiResponse.success(localAlarms(request));
     }
@@ -187,6 +226,31 @@ public class EnergyProxyController {
         Long orgId = optionalLongParam(request, "orgId");
         boolean includeChildren = Boolean.parseBoolean(String.valueOf(request.getParameter("includeChildren")));
         sql.append(accessService.orgFilterSql(column, orgId, includeChildren, args));
+    }
+
+    private Map<String, Object> authorizedDeviceBySn(String deviceSn) {
+        if (deviceSn == null || deviceSn.isBlank()) {
+            throw new BusinessException("deviceSn 不能为空");
+        }
+        List<Map<String, Object>> devices = jdbcTemplate.queryForList("""
+                SELECT d.id, d.device_sn, d.device_name, d.gateway_id, d.org_id, d.device_type_id, d.status,
+                       g.gateway_sn, g.gateway_name, o.org_name
+                FROM dev_device d
+                LEFT JOIN dev_gateway g ON g.id = d.gateway_id
+                LEFT JOIN dev_org o ON o.id = d.org_id
+                WHERE d.device_sn = ?
+                LIMIT 1
+                """, deviceSn.trim());
+        if (devices.isEmpty()) {
+            throw new BusinessException("未找到设备 SN: " + deviceSn.trim());
+        }
+        Map<String, Object> device = devices.get(0);
+        Object id = device.get("id");
+        if (!(id instanceof Number number)) {
+            throw new BusinessException("设备档案 ID 无效");
+        }
+        accessService.assertDeviceAccess(number.longValue());
+        return device;
     }
 
     private Long requiredLongParam(HttpServletRequest request, String name) {

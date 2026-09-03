@@ -33,6 +33,12 @@ public class DataQualityController {
     @SaCheckPermission("energy:quality:list")
     public ApiResponse<Map<String, Object>> detail(@PathVariable long id) { return ApiResponse.success(qualityService.detail(id)); }
 
+    @GetMapping("/events/{id}/replay-precheck")
+    @SaCheckPermission("energy:quality:replay")
+    public ApiResponse<Map<String, Object>> replayPrecheck(@PathVariable long id) {
+        return ApiResponse.success(qualityService.replayPrecheck(id));
+    }
+
     @GetMapping("/collection-daily")
     @SaCheckPermission("energy:quality:list")
     public ApiResponse<PageResult<Map<String, Object>>> collectionDaily(HttpServletRequest request) {
@@ -45,6 +51,12 @@ public class DataQualityController {
         Map<String, Object> event = qualityService.requestReplay(id);
         remoteServiceClient.postAccess("/api/access/raw-messages/" + event.get("raw_log_id") + "/replay", Map.of());
         return ApiResponse.success(qualityService.detail(id));
+    }
+
+    @PostMapping("/events/{id}/work-order")
+    @SaCheckPermission("ops:workorder:create")
+    public ApiResponse<Map<String, Object>> workOrder(@PathVariable long id) {
+        return ApiResponse.success(qualityService.createWorkOrder(id));
     }
 
     private Map<String, String> params(HttpServletRequest request) { return request.getParameterMap().entrySet().stream().collect(java.util.stream.Collectors.toMap(Map.Entry::getKey, entry -> entry.getValue()[0])); }
