@@ -8,6 +8,7 @@ import cn.dev33.satoken.annotation.SaMode;
 import com.parkenergyplatform.aop.OperationLog;
 import com.parkenergyplatform.common.ApiResponse;
 import com.parkenergyplatform.service.DeviceCatalogService;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -16,7 +17,9 @@ import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
 
 @RestController
 @RequestMapping("/api/platform/catalog")
@@ -29,8 +32,9 @@ public class DeviceCatalogController {
 
     @GetMapping("/tree")
     @SaCheckPermission(value = {"catalog:view", "archive:list"}, mode = SaMode.OR)
-    public ApiResponse<List<Map<String, Object>>> tree(@RequestParam(required = false) String keyword) {
-        return ApiResponse.success(catalogService.tree(keyword));
+    public ApiResponse<List<Map<String, Object>>> tree(@RequestParam(required = false) String keyword,
+                                                        @RequestParam(required = false) String depth) {
+        return ApiResponse.success(catalogService.tree(keyword, depth));
     }
 
     @GetMapping("/attribute-tree")
@@ -62,6 +66,36 @@ public class DeviceCatalogController {
     public ApiResponse<Map<String, Object>> detail(@PathVariable long modelId,
                                                     @RequestParam(required = false) Long versionId) {
         return ApiResponse.success(catalogService.detail(modelId, versionId));
+    }
+
+    @PostMapping("/models/{modelId}/image/upload-url")
+    @SaCheckPermission(value = {"catalog:edit", "archive:edit"}, mode = SaMode.OR)
+    public ApiResponse<Map<String, Object>> modelImageUploadUrl(@PathVariable long modelId,
+                                                                @RequestBody Map<String, Object> body) {
+        return ApiResponse.success(catalogService.modelImageUploadUrl(modelId, body));
+    }
+
+    @PostMapping(value = "/models/{modelId}/image/file", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    @SaCheckPermission(value = {"catalog:edit", "archive:edit"}, mode = SaMode.OR)
+    @OperationLog(module = "产品目录", operation = "上传型号图片")
+    public ApiResponse<Map<String, Object>> uploadModelImage(@PathVariable long modelId,
+                                                             @RequestPart("file") MultipartFile file) {
+        return ApiResponse.success(catalogService.uploadModelImage(modelId, file));
+    }
+
+    @PutMapping("/models/{modelId}/image")
+    @SaCheckPermission(value = {"catalog:edit", "archive:edit"}, mode = SaMode.OR)
+    @OperationLog(module = "产品目录", operation = "保存型号图片")
+    public ApiResponse<Map<String, Object>> saveModelImage(@PathVariable long modelId,
+                                                           @RequestBody Map<String, Object> body) {
+        return ApiResponse.success(catalogService.saveModelImage(modelId, body));
+    }
+
+    @DeleteMapping("/models/{modelId}/image")
+    @SaCheckPermission(value = {"catalog:edit", "archive:edit"}, mode = SaMode.OR)
+    @OperationLog(module = "产品目录", operation = "清空型号图片")
+    public ApiResponse<Map<String, Object>> clearModelImage(@PathVariable long modelId) {
+        return ApiResponse.success(catalogService.clearModelImage(modelId));
     }
 
     @PostMapping("/categories")

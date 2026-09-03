@@ -21,10 +21,14 @@ import org.springframework.transaction.annotation.Transactional;
 public class TenantContractService {
     private final JdbcTemplate jdbcTemplate;
     private final BusinessDataAccessService accessService;
+    private final BillingSpaceScopeService spaceScopeService;
+    private final TenantService tenantService;
 
-    public TenantContractService(JdbcTemplate jdbcTemplate, BusinessDataAccessService accessService) {
+    public TenantContractService(JdbcTemplate jdbcTemplate, BusinessDataAccessService accessService, BillingSpaceScopeService spaceScopeService, TenantService tenantService) {
         this.jdbcTemplate = jdbcTemplate;
         this.accessService = accessService;
+        this.spaceScopeService = spaceScopeService;
+        this.tenantService = tenantService;
     }
 
     public PageResult<Map<String, Object>> page(Map<String, String> params) {
@@ -43,29 +47,60 @@ public class TenantContractService {
             for (int i = 0; i < 3; i++) args.add("%" + params.get("keyword").trim() + "%");
         }
         where.append(accessService.scopeSql("c.org_id", args));
+        where.append(tenantService.scopeSql("c.tenant_id", args));
         int pageNum = positive(params.get("pageNum"), 1), pageSize = Math.min(positive(params.get("pageSize"), 20), 200);
         String from = " FROM leasing_contract c JOIN crm_tenant t ON t.id=c.tenant_id LEFT JOIN dev_org o ON o.id=c.org_id";
         Long total = jdbcTemplate.queryForObject("SELECT COUNT(*)" + from + where, Long.class, args.toArray());
         List<Object> pageArgs = new ArrayList<>(args);
         pageArgs.add(pageSize);
         pageArgs.add((pageNum - 1) * pageSize);
-        List<Map<String, Object>> rows = jdbcTemplate.queryForList("SELECT c.*, t.tenant_name, t.contact_name, t.contact_phone, o.org_name" + from + where + " ORDER BY c.id DESC LIMIT ? OFFSET ?", pageArgs.toArray());
+        String select = "SELECT c.id, c.contract_no, c.contract_name, c.tenant_id, c.org_id, c.start_date, c.end_date, c.status, c.create_time, "
+                + "t.tenant_name, t.contact_name, o.org_name";
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(select + from + where + " ORDER BY c.id DESC LIMIT ? OFFSET ?", pageArgs.toArray());
+        hydrateListRelations(rows);
         return PageResult.of(rows, total == null ? 0 : total, pageNum, pageSize);
+    }
+
+    private void hydrateListRelations(List<Map<String, Object>> rows) {
+        if (rows.isEmpty()) return;
+        List<Long> ids = rows.stream().map(row -> Long.valueOf(String.valueOf(row.get("id")))).toList();
+        String placeholders = String.join(",", java.util.Collections.nCopies(ids.size(), "?"));
+        Map<Long, Map<String, Object>> summaries = new LinkedHashMap<>();
+        for (Long id : ids) summaries.put(id, new LinkedHashMap<>());
+        jdbcTemplate.queryForList("SELECT cs.contract_id, GROUP_CONCAT(DISTINCT s.space_name ORDER BY s.space_name SEPARATOR '、') AS names, COUNT(DISTINCT cs.space_id) AS total FROM leasing_contract_space cs JOIN park_space s ON s.id=cs.space_id WHERE cs.contract_id IN (" + placeholders + ") GROUP BY cs.contract_id", ids.toArray())
+                .forEach(row -> { Map<String, Object> summary = summaries.get(Long.valueOf(String.valueOf(row.get("contract_id")))); summary.put("space_names", row.get("names")); summary.put("space_count", row.get("total")); });
+        jdbcTemplate.queryForList("SELECT cm.contract_id, GROUP_CONCAT(DISTINCT CONCAT(COALESCE(d.device_name,d.device_sn),'（',d.device_sn,'）') ORDER BY d.device_name SEPARATOR '、') AS names, COUNT(DISTINCT cm.device_id) AS total FROM leasing_contract_meter cm JOIN dev_device d ON d.id=cm.device_id WHERE cm.contract_id IN (" + placeholders + ") GROUP BY cm.contract_id", ids.toArray())
+                .forEach(row -> { Map<String, Object> summary = summaries.get(Long.valueOf(String.valueOf(row.get("contract_id")))); summary.put("device_names", row.get("names")); summary.put("meter_count", row.get("total")); });
+        jdbcTemplate.queryForList("SELECT ba.contract_id, GROUP_CONCAT(DISTINCT br.rule_name ORDER BY br.rule_name SEPARATOR '、') AS names, COUNT(*) AS total FROM billing_account ba JOIN billing_rule br ON br.account_id=ba.id AND br.enabled=1 WHERE ba.contract_id IN (" + placeholders + ") GROUP BY ba.contract_id", ids.toArray())
+                .forEach(row -> { Map<String, Object> summary = summaries.get(Long.valueOf(String.valueOf(row.get("contract_id")))); summary.put("rule_names", row.get("names")); summary.put("rule_count", row.get("total")); });
+        for (Map<String, Object> row : rows) {
+            Map<String, Object> summary = summaries.get(Long.valueOf(String.valueOf(row.get("id"))));
+            row.putAll(summary);
+            row.putIfAbsent("space_count", 0); row.putIfAbsent("meter_count", 0); row.putIfAbsent("rule_count", 0);
+        }
     }
 
     public Map<String, Object> detail(long id) {
         Map<String, Object> contract = required(id);
         assertAccess(contract);
         Map<String, Object> result = new LinkedHashMap<>(contract);
-        result.put("spaces", jdbcTemplate.queryForList("SELECT cs.*, s.space_code, s.space_name, s.space_type FROM leasing_contract_space cs JOIN park_space s ON s.id=cs.space_id WHERE cs.contract_id=?", id));
-        result.put("meters", jdbcTemplate.queryForList("SELECT cm.*, d.device_sn, d.device_name, d.meter_role FROM leasing_contract_meter cm JOIN dev_device d ON d.id=cm.device_id WHERE cm.contract_id=?", id));
+        List<Map<String, Object>> contractSpaces = jdbcTemplate.queryForList("SELECT cs.*, s.space_code, s.space_name, s.space_type FROM leasing_contract_space cs JOIN park_space s ON s.id=cs.space_id WHERE cs.contract_id=? ORDER BY s.space_name, s.id", id);
+        List<Map<String, Object>> contractMeters = jdbcTemplate.queryForList("SELECT cm.*, d.device_sn, d.device_name, d.meter_role, d.device_type_id, dt.type_code, dt.type_name, d.space_id, s.space_code, s.space_name FROM leasing_contract_meter cm JOIN dev_device d ON d.id=cm.device_id LEFT JOIN dev_device_type dt ON dt.id=d.device_type_id LEFT JOIN park_space s ON s.id=d.space_id WHERE cm.contract_id=? ORDER BY d.device_name, d.id", id);
+        List<Map<String, Object>> contractRules = jdbcTemplate.queryForList("SELECT br.id, br.rule_name, br.price_mode, br.billing_cycle, br.enabled, br.create_time FROM billing_rule br JOIN billing_account ba ON ba.id=br.account_id WHERE ba.contract_id=? ORDER BY br.id", id);
+        result.put("spaces", contractSpaces);
+        result.put("meters", contractMeters);
+        result.put("spaceCount", contractSpaces.size());
+        result.put("meterCount", contractMeters.size());
         result.put("account", singleOrNull("SELECT * FROM billing_account WHERE contract_id=?", id));
+        result.put("rules", contractRules);
+        result.put("ruleCount", contractRules.size());
         return result;
     }
 
     @Transactional
     public Map<String, Object> create(Map<String, Object> body) {
         validate(body);
+        tenantService.assertSelectable(longValue(body.get("tenantId"), "tenantId"));
         long orgId = longValue(body.get("orgId"), "orgId");
         assertOrg(orgId);
         String number = requiredText(body.get("contractNo"), "contractNo");
@@ -85,6 +120,7 @@ public class TenantContractService {
         if (!"DRAFT".equalsIgnoreCase(String.valueOf(existing.get("status"))))
             throw new BusinessException("只有草稿合同允许直接修改；生效合同请走终止或续签流程");
         validate(body);
+        tenantService.assertSelectable(longValue(body.get("tenantId"), "tenantId"));
         assertOrg(longValue(body.get("orgId"), "orgId"));
         jdbcTemplate.update("UPDATE leasing_contract SET tenant_id=?, org_id=?, contract_name=?, start_date=?, end_date=?, settlement_day=?, deposit_amount=?, remark=? WHERE id=?",
                 longValue(body.get("tenantId"), "tenantId"), longValue(body.get("orgId"), "orgId"), requiredText(body.get("contractName"), "contractName"), date(body.get("startDate")), date(body.get("endDate")), numberOr(body.get("settlementDay"), 1), decimal(body.get("depositAmount"), java.math.BigDecimal.ZERO), text(body.get("remark")), id);
@@ -116,7 +152,8 @@ public class TenantContractService {
     public Map<String, Object> terminate(long id, Map<String, Object> body) {
         Map<String, Object> contract = required(id);
         assertAccess(contract);
-        LocalDate end = date(body.get("endDate")).toLocalDate();
+        LocalDate end = body.get("endDate") == null || text(body.get("endDate")) == null
+                ? LocalDate.now() : date(body.get("endDate")).toLocalDate();
         if (end.isBefore(((Date) contract.get("start_date")).toLocalDate()))
             throw new BusinessException("终止日期不能早于合同开始日期");
         jdbcTemplate.update("UPDATE leasing_contract SET status='TERMINATED', end_date=?, remark=CONCAT(COALESCE(remark,''),' [TERMINATED] ',?) WHERE id=?", Date.valueOf(end), text(body.get("remark")), id);
@@ -124,12 +161,44 @@ public class TenantContractService {
         return detail(id);
     }
 
+    @Transactional
+    public void delete(long id) {
+        Map<String, Object> contract = required(id);
+        assertAccess(contract);
+        if (!"TERMINATED".equalsIgnoreCase(String.valueOf(contract.get("status"))))
+            throw new BusinessException("只有已终止合同可以删除");
+        if (count("SELECT COUNT(*) FROM billing_bill b JOIN billing_account a ON a.id=b.account_id WHERE a.contract_id=?", id) > 0)
+            throw new BusinessException("合同已经产生账单，不能删除；请保留合同档案");
+        // 账户和规则可能已经被其他财务辅助表引用。合同删除时保留其技术账户但解除合同归属，
+        // 同时停用规则，避免为了删除一条已终止合同破坏历史关联或触发外键 500。
+        List<Map<String, Object>> accounts = jdbcTemplate.queryForList("SELECT id FROM billing_account WHERE contract_id=?", id);
+        for (Map<String, Object> account : accounts) {
+            jdbcTemplate.update("UPDATE billing_rule SET enabled=0 WHERE account_id=?", account.get("id"));
+        }
+        jdbcTemplate.update("UPDATE billing_account SET contract_id=NULL, status=0 WHERE contract_id=?", id);
+        jdbcTemplate.update("DELETE FROM leasing_contract_space WHERE contract_id=?", id);
+        jdbcTemplate.update("DELETE FROM leasing_contract_meter WHERE contract_id=?", id);
+        jdbcTemplate.update("DELETE FROM leasing_contract WHERE id=?", id);
+    }
+
     private void replaceRelations(long contractId, Map<String, Object> body) {
+        List<Map<String, Object>> spaces = list(body.get("spaces"), "spaces");
+        List<Map<String, Object>> meters = list(body.get("meters"), "meters");
+        List<Long> spaceIds = spaces.stream().map(x -> longValue(x.get("spaceId"), "spaceId")).toList();
+        List<Long> meterIds = meters.stream().map(x -> longValue(x.get("deviceId"), "deviceId")).toList();
+        spaceScopeService.assertDevicesWithinSpaces(spaceIds, meterIds);
         jdbcTemplate.update("DELETE FROM leasing_contract_space WHERE contract_id=?", contractId);
         jdbcTemplate.update("DELETE FROM leasing_contract_meter WHERE contract_id=?", contractId);
-        for (Map<String, Object> space : list(body.get("spaces"), "spaces"))
-            jdbcTemplate.update("INSERT INTO leasing_contract_space (contract_id, space_id, rent_start_date, rent_end_date) VALUES (?, ?, ?, ?)", contractId, longValue(space.get("spaceId"), "spaceId"), date(space.getOrDefault("startDate", body.get("startDate"))), nullableDate(space.get("endDate")));
-        for (Map<String, Object> meter : list(body.get("meters"), "meters")) {
+        for (Map<String, Object> space : spaces) {
+            long spaceId = longValue(space.get("spaceId"), "spaceId");
+            Map<String, Object> spaceRow = singleOrNull("SELECT id, status FROM park_space WHERE id=?", spaceId);
+            if (spaceRow == null) throw new BusinessException("绑定空间不存在");
+            String status = String.valueOf(spaceRow.get("status"));
+            if ("DISABLED".equalsIgnoreCase(status) || "INACTIVE".equalsIgnoreCase(status))
+                throw new BusinessException("不能绑定已停用空间，请重新选择可用空间");
+            jdbcTemplate.update("INSERT INTO leasing_contract_space (contract_id, space_id, rent_start_date, rent_end_date) VALUES (?, ?, ?, ?)", contractId, spaceId, date(space.getOrDefault("startDate", body.get("startDate"))), nullableDate(space.get("endDate")));
+        }
+        for (Map<String, Object> meter : meters) {
             long deviceId = longValue(meter.get("deviceId"), "deviceId");
             java.math.BigDecimal factor = decimal(meter.get("meterFactor"), deviceMeterFactor(deviceId));
             if (factor.compareTo(java.math.BigDecimal.ZERO) <= 0) throw new BusinessException("结算表计倍率必须大于 0");
@@ -172,7 +241,7 @@ public class TenantContractService {
     }
 
     private Map<String, Object> required(long id) {
-        Map<String, Object> row = singleOrNull("SELECT c.*,t.tenant_name,o.org_name FROM leasing_contract c JOIN crm_tenant t ON t.id=c.tenant_id JOIN dev_org o ON o.id=c.org_id WHERE c.id=?", id);
+        Map<String, Object> row = singleOrNull("SELECT c.*,t.tenant_name,t.contact_name,o.org_name FROM leasing_contract c JOIN crm_tenant t ON t.id=c.tenant_id JOIN dev_org o ON o.id=c.org_id WHERE c.id=?", id);
         if (row == null) throw new BusinessException(404, "合同不存在");
         return row;
     }
@@ -190,6 +259,7 @@ public class TenantContractService {
 
     private void assertAccess(Map<String, Object> c) {
         assertOrg(((Number) c.get("org_id")).longValue());
+        tenantService.assertVisible(((Number) c.get("tenant_id")).longValue());
     }
 
     private void assertOrg(long orgId) {

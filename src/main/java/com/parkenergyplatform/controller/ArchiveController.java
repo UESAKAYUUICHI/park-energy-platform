@@ -1,6 +1,7 @@
 package com.parkenergyplatform.controller;
 
 import java.util.Map;
+import java.util.List;
 
 import cn.dev33.satoken.annotation.SaCheckPermission;
 import com.parkenergyplatform.aop.OperationLog;
@@ -9,6 +10,7 @@ import com.parkenergyplatform.common.PageResult;
 import com.parkenergyplatform.service.BusinessWorkspaceService;
 import com.parkenergyplatform.service.PlatformBusinessQueryService;
 import com.parkenergyplatform.service.SimpleTableService;
+import com.parkenergyplatform.service.MeterTemplateService;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -25,12 +27,14 @@ public class ArchiveController {
     private final SimpleTableService tableService;
     private final PlatformBusinessQueryService queryService;
     private final BusinessWorkspaceService workspaceService;
+    private final MeterTemplateService meterTemplateService;
 
     public ArchiveController(SimpleTableService tableService, PlatformBusinessQueryService queryService,
-                             BusinessWorkspaceService workspaceService) {
+                             BusinessWorkspaceService workspaceService, MeterTemplateService meterTemplateService) {
         this.tableService = tableService;
         this.queryService = queryService;
         this.workspaceService = workspaceService;
+        this.meterTemplateService = meterTemplateService;
     }
 
     @GetMapping("/org-tree")
@@ -51,10 +55,35 @@ public class ArchiveController {
         return ApiResponse.success(queryService.rootOrgs());
     }
 
+    @GetMapping("/meter-templates")
+    @SaCheckPermission("archive:list")
+    public ApiResponse<Object> meterTemplates() {
+        return ApiResponse.success(meterTemplateService.list());
+    }
+
+    @PostMapping("/meter-templates")
+    @SaCheckPermission("archive:edit")
+    public ApiResponse<Object> createMeterTemplate(@RequestBody Map<String, Object> body) {
+        return ApiResponse.success(meterTemplateService.create(body));
+    }
+
+    @DeleteMapping("/meter-templates/{id}")
+    @SaCheckPermission("archive:edit")
+    public ApiResponse<Void> deleteMeterTemplate(@PathVariable long id) {
+        meterTemplateService.delete(id);
+        return ApiResponse.success(null);
+    }
+
     @GetMapping("/devices/{deviceId}/profile")
     @SaCheckPermission("archive:list")
     public ApiResponse<Map<String, Object>> deviceProfile(@PathVariable long deviceId) {
         return ApiResponse.success(queryService.deviceProfile(deviceId));
+    }
+
+    @GetMapping("/devices/cards")
+    @SaCheckPermission("archive:list")
+    public ApiResponse<PageResult<Map<String, Object>>> deviceCards(HttpServletRequest request) {
+        return ApiResponse.success(queryService.deviceCards(queryParams(request)));
     }
 
     @GetMapping("/devices/{deviceId}/archive-profile")
@@ -107,6 +136,12 @@ public class ArchiveController {
     @SaCheckPermission("archive:list")
     public ApiResponse<PageResult<Map<String, Object>>> page(@PathVariable String resource, HttpServletRequest request) {
         return ApiResponse.success(tableService.page(resource, queryParams(request)));
+    }
+
+    @GetMapping("/{resource}/options")
+    @SaCheckPermission("archive:list")
+    public ApiResponse<List<Map<String, Object>>> options(@PathVariable String resource, HttpServletRequest request) {
+        return ApiResponse.success(tableService.options(resource, queryParams(request)));
     }
 
     @GetMapping("/{resource}/{id}")
