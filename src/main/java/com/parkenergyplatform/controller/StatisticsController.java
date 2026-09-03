@@ -38,6 +38,12 @@ public class StatisticsController {
         return ApiResponse.success(queryService.dailySummary(queryParams(request)));
     }
 
+    @GetMapping("/hourly")
+    @SaCheckPermission("energy:view")
+    public ApiResponse<Object> hourly(HttpServletRequest request) {
+        return ApiResponse.success(queryService.hourlyStats(queryParams(request)));
+    }
+
     @GetMapping("/monthly")
     @SaCheckPermission("energy:view")
     public ApiResponse<Object> monthly(HttpServletRequest request) {
@@ -54,6 +60,12 @@ public class StatisticsController {
     @SaCheckPermission("energy:statistics:rebuild")
     public ApiResponse<Object> rebuildDaily(HttpServletRequest request) {
         return ApiResponse.success(queryService.rebuildDailyStats(queryParams(request)));
+    }
+
+    @PostMapping("/hourly/rebuild")
+    @SaCheckPermission("energy:statistics:rebuild")
+    public ApiResponse<Object> rebuildHourly(HttpServletRequest request) {
+        return ApiResponse.success(queryService.rebuildHourlyStats(queryParams(request)));
     }
 
     @GetMapping("/tou")

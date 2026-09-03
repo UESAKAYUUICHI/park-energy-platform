@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.Map;
 
 import cn.dev33.satoken.annotation.SaCheckPermission;
+import cn.dev33.satoken.stp.StpUtil;
 import com.parkenergyplatform.aop.OperationLog;
 import com.parkenergyplatform.common.ApiResponse;
 import com.parkenergyplatform.common.PageResult;
@@ -34,6 +35,12 @@ public class OperationsController {
         return ApiResponse.success(operationsService.workOrders(params(request)));
     }
 
+    @GetMapping("/work-orders/status-counts")
+    @SaCheckPermission("ops:workorder:list")
+    public ApiResponse<Map<String, Long>> workOrderStatusCounts(HttpServletRequest request) {
+        return ApiResponse.success(operationsService.workOrderStatusCounts(params(request)));
+    }
+
     @GetMapping("/work-orders/{id}")
     @SaCheckPermission("ops:workorder:list")
     public ApiResponse<Map<String, Object>> workOrder(@PathVariable long id) {
@@ -41,10 +48,17 @@ public class OperationsController {
     }
 
     @GetMapping("/assignees")
-    @SaCheckPermission("ops:workorder:operate")
+    @SaCheckPermission("ops:workorder:assign")
     public ApiResponse<List<Map<String, Object>>> assignees(@RequestParam long orgId,
                                                             @RequestParam(required = false) String keyword) {
         return ApiResponse.success(operationsService.assignees(orgId, keyword));
+    }
+
+    @GetMapping("/inspection-assignees")
+    @SaCheckPermission("ops:inspection:edit")
+    public ApiResponse<List<Map<String, Object>>> inspectionAssignees(@RequestParam long orgId,
+                                                                      @RequestParam(required = false) String keyword) {
+        return ApiResponse.success(operationsService.inspectionAssignees(orgId, keyword));
     }
 
     @PostMapping("/work-orders")
@@ -62,10 +76,10 @@ public class OperationsController {
     }
 
     @PostMapping("/work-orders/{id}/{action}")
-    @SaCheckPermission("ops:workorder:operate")
     @OperationLog(module = "设备运维", operation = "流转运维工单")
     public ApiResponse<Map<String, Object>> operate(@PathVariable long id, @PathVariable String action,
                                                      @RequestBody Map<String, Object> body) {
+        StpUtil.checkPermission(actionPermission(action));
         return ApiResponse.success(operationsService.operate(id, action, body));
     }
 
@@ -94,7 +108,7 @@ public class OperationsController {
     @OperationLog(module = "设备运维", operation = "生成巡检任务")
     public ApiResponse<Map<String, Object>> generateInspectionTasks(@RequestParam(required = false) String taskDate) {
         LocalDate date = taskDate == null || taskDate.isBlank() ? LocalDate.now() : LocalDate.parse(taskDate);
-        return ApiResponse.success(Map.of("taskDate", date, "created", operationsService.generateInspectionTasks(date)));
+        return ApiResponse.success(Map.of("taskDate", date, "created", operationsService.generateInspectionTasksForCurrentAccess(date)));
     }
 
     @GetMapping("/inspection-tasks")
@@ -113,5 +127,16 @@ public class OperationsController {
     private Map<String, String> params(HttpServletRequest request) {
         return request.getParameterMap().entrySet().stream()
                 .collect(java.util.stream.Collectors.toMap(Map.Entry::getKey, entry -> entry.getValue()[0]));
+    }
+
+    private String actionPermission(String action) {
+        return switch (action == null ? "" : action.toUpperCase()) {
+            case "ASSIGN" -> "ops:workorder:assign";
+            case "ACCEPT" -> "ops:workorder:accept";
+            case "ARRIVE", "COMPLETE" -> "ops:workorder:execute";
+            case "VERIFY" -> "ops:workorder:verify";
+            case "CANCEL" -> "ops:workorder:cancel";
+            default -> "ops:workorder:operate";
+        };
     }
 }
