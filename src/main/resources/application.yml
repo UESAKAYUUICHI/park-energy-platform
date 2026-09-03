@@ -4,16 +4,57 @@ server:
 spring:
   application:
     name: park-energy-platform
+  servlet:
+    multipart:
+      max-file-size: 5MB
+      max-request-size: 6MB
   datasource:
-    url: ${PARK_DB_URL:jdbc:mysql://115.159.222.238:3306/park_energy_system?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true}
-    username: admin
-    password: 'Saki#Mygo06'
+    url: ${PARK_DB_URL:jdbc:mysql://localhost:3306/park_energy_system?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true}
+    username: ${PARK_DB_USERNAME:root}
+    password: ${PARK_DB_PASSWORD:}
     driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      pool-name: ParkPlatformPool
+      maximum-pool-size: ${PLATFORM_DB_POOL_MAX_SIZE:6}
+      minimum-idle: ${PLATFORM_DB_POOL_MIN_IDLE:0}
+      connection-timeout: ${DB_POOL_CONNECTION_TIMEOUT_MS:5000}
+      validation-timeout: ${DB_POOL_VALIDATION_TIMEOUT_MS:2000}
+      idle-timeout: ${DB_POOL_IDLE_TIMEOUT_MS:10000}
+      max-lifetime: ${DB_POOL_MAX_LIFETIME_MS:60000}
+      keepalive-time: 0
+      connection-test-query: SELECT 1
+      data-source-properties:
+        connectTimeout: ${DB_CONNECT_TIMEOUT_MS:3000}
+        socketTimeout: ${DB_SOCKET_TIMEOUT_MS:8000}
+        tcpKeepAlive: true
 
 park:
+  security:
+    local-admin-fallback-enabled: ${PARK_LOCAL_ADMIN_FALLBACK_ENABLED:false}
+    local-admin-fallback-username: ${PARK_LOCAL_ADMIN_FALLBACK_USERNAME:}
+    local-admin-fallback-password: ${PARK_LOCAL_ADMIN_FALLBACK_PASSWORD:}
+    # Explicitly disabled by default; enable only in a local test process.
+    local-test-login-enabled: ${PARK_LOCAL_TEST_LOGIN_ENABLED:false}
+    local-test-login-username: ${PARK_LOCAL_TEST_LOGIN_USERNAME:test}
+    local-test-login-password: ${PARK_LOCAL_TEST_LOGIN_PASSWORD:test}
+    local-test-login-target: ${PARK_LOCAL_TEST_LOGIN_TARGET:admin}
+  alarm:
+    automation-interval-ms: ${PARK_ALARM_AUTOMATION_INTERVAL_MS:1000}
+    automation-initial-delay-ms: ${PARK_ALARM_AUTOMATION_INITIAL_DELAY_MS:3000}
+    default-recovery-hold-seconds: ${PARK_ALARM_RECOVERY_HOLD_SECONDS:8}
   platform:
-    data-base-url: ${PARK_DATA_BASE_URL:http://localhost:8102}
-    access-base-url: ${PARK_ACCESS_BASE_URL:http://localhost:8101}
+    data-base-url: http://localhost:8102
+    access-base-url: http://localhost:8101
+    remote-connect-timeout-ms: ${REMOTE_SERVICE_CONNECT_TIMEOUT_MS:1000}
+    remote-read-timeout-ms: ${REMOTE_SERVICE_READ_TIMEOUT_MS:3000}
+  cos:
+    enabled: ${PARK_COS_ENABLED:false}
+    bucket: ${PARK_COS_BUCKET:iotserver-1460880192}
+    region: ${PARK_COS_REGION:ap-shanghai}
+    secret-id: ${PARK_COS_SECRET_ID:}
+    secret-key: ${PARK_COS_SECRET_KEY:}
+    object-prefix: ${PARK_COS_OBJECT_PREFIX:device-models/}
+    url-expire-seconds: ${PARK_COS_URL_EXPIRE_SECONDS:600}
 
 sa-token:
   token-name: Authorization

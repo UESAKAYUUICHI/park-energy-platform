@@ -19,9 +19,15 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 
 @Service
 public class DataScopeService {
+    private static final String SUPER_ADMIN_ATTRIBUTE = DataScopeService.class.getName() + ".superAdmin.";
+    private static final String VISIBLE_ORGS_ATTRIBUTE = DataScopeService.class.getName() + ".visibleOrgs.";
+    private static final String ORG_CHILDREN_ATTRIBUTE = DataScopeService.class.getName() + ".orgChildren";
+    private static final String ORG_SUBTREE_ATTRIBUTE = DataScopeService.class.getName() + ".orgSubtree.";
     private final JdbcTemplate jdbcTemplate;
     private final SysUserMapper sysUserMapper;
     private final SysUserOrgScopeMapper scopeMapper;
@@ -33,13 +39,25 @@ public class DataScopeService {
     }
 
     public boolean isSuperAdmin(long userId) {
+        ServletRequestAttributes attributes = requestAttributes();
+        String key = SUPER_ADMIN_ATTRIBUTE + userId;
+        if (attributes != null) {
+            Object cached = attributes.getRequest().getAttribute(key);
+            if (cached instanceof Boolean value) {
+                return value;
+            }
+        }
         Long count = jdbcTemplate.queryForObject("""
                 SELECT COUNT(*)
                 FROM sys_user_role ur
                 JOIN sys_role r ON r.id = ur.role_id
                 WHERE ur.user_id = ? AND r.role_code = 'super_admin' AND r.status = 1
                 """, Long.class, userId);
-        return count != null && count > 0;
+        boolean result = count != null && count > 0;
+        if (attributes != null) {
+            attributes.getRequest().setAttribute(key, result);
+        }
+        return result;
     }
 
     public Long userOrgId(long userId) {
@@ -86,6 +104,22 @@ public class DataScopeService {
     }
 
     public Set<Long> visibleOrgIds(long userId) {
+        ServletRequestAttributes attributes = requestAttributes();
+        String key = VISIBLE_ORGS_ATTRIBUTE + userId;
+        if (attributes != null) {
+            Object cached = attributes.getRequest().getAttribute(key);
+            if (cached instanceof VisibleOrgScope scope) {
+                return scope.orgIds();
+            }
+        }
+        Set<Long> resolved = resolveVisibleOrgIds(userId);
+        if (attributes != null) {
+            attributes.getRequest().setAttribute(key, new VisibleOrgScope(resolved));
+        }
+        return resolved;
+    }
+
+    private Set<Long> resolveVisibleOrgIds(long userId) {
         if (isSuperAdmin(userId)) {
             return null;
         }
@@ -115,10 +149,24 @@ public class DataScopeService {
     }
 
     public List<Long> orgSubtreeIds(long rootOrgId) {
+        ServletRequestAttributes attributes = requestAttributes();
+        String key = ORG_SUBTREE_ATTRIBUTE + rootOrgId;
+        if (attributes != null) {
+            Object cached = attributes.getRequest().getAttribute(key);
+            if (cached instanceof List<?> rows) {
+                @SuppressWarnings("unchecked")
+                List<Long> result = (List<Long>) rows;
+                return result;
+            }
+        }
         Map<Long, List<Long>> children = loadOrgChildren();
         Set<Long> visible = new LinkedHashSet<>();
         expand(rootOrgId, children, visible);
-        return new ArrayList<>(visible);
+        List<Long> result = new ArrayList<>(visible);
+        if (attributes != null) {
+            attributes.getRequest().setAttribute(key, result);
+        }
+        return result;
     }
 
     public String inClause(String column, Set<Long> ids, List<Object> args) {
@@ -189,6 +237,15 @@ public class DataScopeService {
     }
 
     private Map<Long, List<Long>> loadOrgChildren() {
+        ServletRequestAttributes attributes = requestAttributes();
+        if (attributes != null) {
+            Object cached = attributes.getRequest().getAttribute(ORG_CHILDREN_ATTRIBUTE);
+            if (cached instanceof Map<?, ?> rows) {
+                @SuppressWarnings("unchecked")
+                Map<Long, List<Long>> result = (Map<Long, List<Long>>) rows;
+                return result;
+            }
+        }
         List<Map<String, Object>> rows = jdbcTemplate.queryForList("SELECT id, parent_id FROM dev_org ORDER BY parent_id, sort, id");
         Map<Long, List<Long>> children = new LinkedHashMap<>();
         for (Map<String, Object> row : rows) {
@@ -199,7 +256,15 @@ public class DataScopeService {
             }
             children.computeIfAbsent(parentId == null ? 0L : parentId, key -> new ArrayList<>()).add(id);
         }
+        if (attributes != null) {
+            attributes.getRequest().setAttribute(ORG_CHILDREN_ATTRIBUTE, children);
+        }
         return children;
+    }
+
+    private ServletRequestAttributes requestAttributes() {
+        return RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attributes
+                ? attributes : null;
     }
 
     private Long visibleRoot(Set<Long> visible) {
@@ -264,5 +329,9 @@ public class DataScopeService {
     }
 
     private record ScopeNode(Long orgId, String scopeMode) {
+    }
+
+    /** A wrapper preserves the meaningful {@code null}: unrestricted super-admin scope. */
+    private record VisibleOrgScope(Set<Long> orgIds) {
     }
 }

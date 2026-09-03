@@ -32,6 +32,7 @@ import com.parkenergyplatform.mapper.SysRolePermissionMapper;
 import com.parkenergyplatform.mapper.SysUserMapper;
 import com.parkenergyplatform.mapper.SysUserRoleMapper;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -48,6 +49,31 @@ public class RbacService {
     private final JdbcTemplate jdbcTemplate;
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
+    @Value("${park.security.local-admin-fallback-enabled:false}")
+    private boolean localAdminFallbackEnabled;
+
+    @Value("${park.security.local-admin-fallback-username:}")
+    private String localAdminFallbackUsername;
+
+    @Value("${park.security.local-admin-fallback-password:}")
+    private String localAdminFallbackPassword;
+
+    /**
+     * Development-only shortcut. It is deliberately disabled by default and must
+     * be enabled explicitly through the local process environment.
+     */
+    @Value("${park.security.local-test-login-enabled:false}")
+    private boolean localTestLoginEnabled;
+
+    @Value("${park.security.local-test-login-username:test}")
+    private String localTestLoginUsername;
+
+    @Value("${park.security.local-test-login-password:test}")
+    private String localTestLoginPassword;
+
+    @Value("${park.security.local-test-login-target:admin}")
+    private String localTestLoginTarget;
+
     public RbacService(SysUserMapper userMapper, SysRoleMapper roleMapper, SysPermissionMapper permissionMapper,
                        SysUserRoleMapper userRoleMapper, SysRolePermissionMapper rolePermissionMapper,
                        DataScopeService dataScopeService, JdbcTemplate jdbcTemplate) {
@@ -61,8 +87,13 @@ public class RbacService {
     }
 
     public Map<String, Object> login(LoginRequest request) {
-        SysUser user = userMapper.selectOne(new LambdaQueryWrapper<SysUser>().eq(SysUser::getUsername, request.username()));
-        if (user == null || (!passwordMatches(request.password(), user.getPassword()) && !localAdminFallback(request))) {
+        boolean localTestLogin = localTestLoginEnabled
+                && localTestLoginUsername.equals(request.username())
+                && localTestLoginPassword.equals(request.password());
+        String loginUsername = localTestLogin ? localTestLoginTarget : request.username();
+        SysUser user = userMapper.selectOne(new LambdaQueryWrapper<SysUser>().eq(SysUser::getUsername, loginUsername));
+        boolean passwordValid = localTestLogin || (user != null && passwordMatches(request.password(), user.getPassword()));
+        if (user == null || (!passwordValid && !localAdminFallback(request))) {
             throw new BusinessException(401, "用户名或密码错误");
         }
         if (!Objects.equals(user.getStatus(), 1)) {
@@ -75,6 +106,52 @@ public class RbacService {
     public Map<String, Object> currentUser() {
         SysUser user = requireUser(StpUtil.getLoginIdAsLong());
         return sessionPayload(user);
+    }
+
+    /** Small self-service projection: avoids loading the full RBAC catalogue just to render one person's page. */
+    public Map<String, Object> personalSummary() {
+        long userId = StpUtil.getLoginIdAsLong();
+        SysUser user = requireUser(userId);
+        user.setPassword(null);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("user", user);
+        result.put("roles", jdbcTemplate.queryForList("""
+                SELECT r.role_code, r.role_name FROM sys_user_role ur
+                JOIN sys_role r ON r.id=ur.role_id AND r.status=1 WHERE ur.user_id=? ORDER BY r.id
+                """, userId));
+        result.put("orgScopes", dataScopeService.userOrgScopes(userId));
+        Long openOrders = jdbcTemplate.queryForObject("""
+                SELECT COUNT(*) FROM ops_work_order
+                WHERE assignee_user_id=? AND status NOT IN ('CLOSED','CANCELLED')
+                """, Long.class, userId);
+        Long notificationCount = jdbcTemplate.queryForObject("""
+                SELECT COUNT(*) FROM ops_notification WHERE receiver_user_id=? AND read_status=0
+                """, Long.class, userId);
+        result.put("work", Map.of("openWorkOrderCount", openOrders == null ? 0 : openOrders,
+                "unreadNotificationCount", notificationCount == null ? 0 : notificationCount));
+        return result;
+    }
+
+    @Transactional
+    public Map<String, Object> updateCurrentProfile(Map<String, Object> request) {
+        SysUser user = requireUser(StpUtil.getLoginIdAsLong());
+        user.setNickname(profileText(request.get("nickname"), "昵称", 50));
+        user.setPhone(profileText(request.get("phone"), "手机号", 20));
+        user.setEmail(profileText(request.get("email"), "邮箱", 100));
+        user.setAvatar(profileText(request.get("avatar"), "头像地址", 500));
+        userMapper.updateById(user);
+        return currentUser();
+    }
+
+    @Transactional
+    public void changeCurrentPassword(Map<String, Object> request) {
+        String currentPassword = requiredText(request.get("currentPassword"), "currentPassword");
+        String newPassword = requiredText(request.get("newPassword"), "newPassword");
+        if (newPassword.length() < 6 || newPassword.length() > 64) throw new BusinessException("新密码长度应为 6 至 64 位");
+        SysUser user = requireUser(StpUtil.getLoginIdAsLong());
+        if (!passwordMatches(currentPassword, user.getPassword())) throw new BusinessException(400, "当前密码不正确");
+        user.setPassword(passwordEncoder.encode(newPassword));
+        userMapper.updateById(user);
     }
 
     public List<String> roleCodes(long userId) {
@@ -374,7 +451,24 @@ public class RbacService {
         return Objects.equals(raw, encoded);
     }
 
-    private boolean localAdminFallback(LoginRequest request) {
-        return Objects.equals("admin", request.username()) && Objects.equals("123456", request.password());
+    private String profileText(Object value, String field, int maxLength) {
+        if (value == null) return null;
+        String text = String.valueOf(value).trim();
+        if (text.length() > maxLength) throw new BusinessException(field + "长度不能超过" + maxLength + "个字符");
+        return text.isEmpty() ? null : text;
     }
+
+    private String requiredText(Object value, String field) {
+        if (value == null || String.valueOf(value).isBlank()) throw new BusinessException(field + "不能为空");
+        return String.valueOf(value).trim();
+    }
+
+    private boolean localAdminFallback(LoginRequest request) {
+        return localAdminFallbackEnabled
+                && StringUtils.hasText(localAdminFallbackUsername)
+                && StringUtils.hasText(localAdminFallbackPassword)
+                && Objects.equals(localAdminFallbackUsername, request.username())
+                && Objects.equals(localAdminFallbackPassword, request.password());
+    }
+
 }
