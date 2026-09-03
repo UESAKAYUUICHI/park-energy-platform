@@ -69,7 +69,10 @@ public class TariffPlanService {
         long orgId = longValue(body.get("orgId"), "orgId");
         assertOrg(orgId);
         validateBody(body);
-        String code = requiredText(body.get("planCode"), "planCode");
+        String code = text(body.get("planCode"));
+        if (code == null) code = "TOU-" + java.time.format.DateTimeFormatter.ofPattern("yyyyMMddHHmmssSSS").format(java.time.LocalDateTime.now());
+        body = new LinkedHashMap<>(body);
+        body.put("planCode", code);
         int version = numberOr(body.get("version"), 1);
         if (exists("SELECT COUNT(*) FROM billing_tariff_plan WHERE org_id = ? AND plan_code = ? AND version = ?", orgId, code, version)) {
             throw new BusinessException(409, "同一园区下方案编码与版本已存在");
@@ -97,6 +100,26 @@ public class TariffPlanService {
                 textOr(body, "timezone", previous.get("timezone"), "Asia/Shanghai"), text(body.get("remark")), id);
         replacePeriods(id, periods(body));
         return detail(id);
+    }
+
+    @Transactional
+    public void delete(long id) {
+        Map<String, Object> plan = required(id);
+        assertPlanAccess(plan);
+        Long activeContracts = jdbcTemplate.queryForObject("""
+                SELECT COUNT(*)
+                FROM billing_rule br
+                JOIN billing_account ba ON ba.id=br.account_id
+                JOIN leasing_contract c ON c.id=ba.contract_id
+                WHERE br.tariff_plan_id=? AND c.status<>'TERMINATED'
+                """, Long.class, id);
+        if (activeContracts != null && activeContracts > 0)
+            throw new BusinessException("该电价方案仍被未终止合同使用，合同停用后才允许删除");
+        Long references = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM billing_rule WHERE tariff_plan_id=?", Long.class, id);
+        if (references != null && references > 0)
+            throw new BusinessException("该电价方案已被历史计价规则引用，不能删除；请停用方案");
+        jdbcTemplate.update("DELETE FROM billing_tariff_period WHERE tariff_plan_id=?", id);
+        jdbcTemplate.update("DELETE FROM billing_tariff_plan WHERE id=?", id);
     }
 
     public Map<String, Object> validate(Map<String, Object> body) {

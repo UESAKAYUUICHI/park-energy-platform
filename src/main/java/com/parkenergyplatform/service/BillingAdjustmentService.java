@@ -24,10 +24,15 @@ public class BillingAdjustmentService {
     private static final Set<String> TYPES = Set.of("DISCOUNT", "SURCHARGE", "WRITE_OFF");
     private final JdbcTemplate jdbcTemplate;
     private final BusinessDataAccessService accessService;
+    private final BillingFinanceService financeService;
+    private final BillingPeriodGuardService periodGuard;
 
-    public BillingAdjustmentService(JdbcTemplate jdbcTemplate, BusinessDataAccessService accessService) {
+    public BillingAdjustmentService(JdbcTemplate jdbcTemplate, BusinessDataAccessService accessService,
+                                    BillingFinanceService financeService, BillingPeriodGuardService periodGuard) {
         this.jdbcTemplate = jdbcTemplate;
         this.accessService = accessService;
+        this.financeService = financeService;
+        this.periodGuard = periodGuard;
     }
 
     public PageResult<Map<String, Object>> page(Map<String, String> params) {
@@ -49,6 +54,7 @@ public class BillingAdjustmentService {
     @Transactional
     public Map<String, Object> create(Map<String, Object> body) {
         long billId = number(body.get("billId"), "billId");
+        periodGuard.assertBillWritable(billId);
         accessService.assertBillAccess(billId);
         Map<String, Object> bill = requiredBill(billId, false);
         if (!"ISSUED".equalsIgnoreCase(Objects.toString(bill.get("bill_status"), ""))) throw new BusinessException("仅已发布账单可创建调整单");
@@ -68,6 +74,7 @@ public class BillingAdjustmentService {
     public Map<String, Object> approve(long adjustmentId, String operator) {
         Map<String, Object> adjustment = requiredAdjustment(adjustmentId, true);
         long billId = number(adjustment.get("bill_id"), "billId");
+        periodGuard.assertBillWritable(billId);
         accessService.assertBillAccess(billId);
         if (!"PENDING".equalsIgnoreCase(Objects.toString(adjustment.get("status"), ""))) throw new BusinessException("仅待审批调整单可以审批");
         Map<String, Object> bill = requiredBill(billId, true);
@@ -84,6 +91,10 @@ public class BillingAdjustmentService {
         int payStatus = outstanding.compareTo(BigDecimal.ZERO) == 0 ? 1 : (paid.compareTo(BigDecimal.ZERO) > 0 ? 4 : 0);
         jdbcTemplate.update("UPDATE billing_bill SET total_amount = ?, outstanding_amount = ?, pay_status = ? WHERE id = ?", newTotal, outstanding, payStatus, billId);
         jdbcTemplate.update("UPDATE billing_adjustment SET status = 'APPROVED', approved_by = ?, approved_time = ? WHERE id = ?", operator, Timestamp.valueOf(LocalDateTime.now()), adjustmentId);
+        financeService.adjustment(billId, number(bill.get("account_id"), "accountId"), adjustmentId, type, amount,
+                Objects.toString(adjustment.get("adjustment_no"), null), operator);
+        financeService.recordEvent(billId, "ADJUSTMENT_APPROVED", bill.get("bill_status"), bill.get("bill_status"),
+                bill.get("pay_status"), payStatus, delta, operator, "调整单审批通过：" + adjustment.get("adjustment_no"));
         return detail(adjustmentId);
     }
 
@@ -91,6 +102,7 @@ public class BillingAdjustmentService {
     public Map<String, Object> cancel(long adjustmentId, String operator) {
         Map<String, Object> adjustment = requiredAdjustment(adjustmentId, true);
         long billId = number(adjustment.get("bill_id"), "billId");
+        periodGuard.assertBillWritable(billId);
         accessService.assertBillAccess(billId);
         if (!"PENDING".equalsIgnoreCase(Objects.toString(adjustment.get("status"), ""))) throw new BusinessException("仅待审批调整单可以撤销");
         jdbcTemplate.update("UPDATE billing_adjustment SET status = 'CANCELLED', cancelled_by = ?, cancelled_time = ? WHERE id = ?", operator, Timestamp.valueOf(LocalDateTime.now()), adjustmentId);

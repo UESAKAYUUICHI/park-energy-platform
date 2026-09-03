@@ -71,6 +71,12 @@ public class BillingCollectionService {
             args.add("%" + keyword + "%");
             args.add("%" + keyword + "%");
         }
+        Long accountId = longOrNull(params.get("accountId"));
+        if (accountId != null) {
+            accessService.assertBillingAccountAccess(accountId);
+            where.append(" AND b.account_id = ?");
+            args.add(accountId);
+        }
         where.append(accessService.scopeSql("a.org_id", args));
         String from = " FROM billing_bill b JOIN billing_account a ON a.id = b.account_id";
         Long total = jdbcTemplate.queryForObject("SELECT COUNT(*)" + from + where, Long.class, args.toArray());
@@ -121,6 +127,15 @@ public class BillingCollectionService {
             return parsed > 0 ? parsed : defaultValue;
         } catch (RuntimeException exception) {
             return defaultValue;
+        }
+    }
+
+    private Long longOrNull(String value) {
+        if (value == null || value.isBlank()) return null;
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException exception) {
+            throw new BusinessException("accountId 必须为数字");
         }
     }
 }
