@@ -1,3 +1,0 @@
-WARNING: Final field sql in class org.apache.ibatis.mapping.BoundSql has been mutated reflectively by class org.apache.ibatis.reflection.invoker.SetFieldInvoker in unnamed module @4b5a5ed1 (jar:nested:/D:/Code/EC-EnergySys/park-energy-platform/target/park-energy-platform-0.0.1-SNAPSHOT.jar/!BOOT-INF/lib/mybatis-3.5.19.jar!/)
-WARNING: Use --enable-final-field-mutation=ALL-UNNAMED to avoid a warning
-WARNING: Mutating final fields will be blocked in a future release unless final field mutation is enabled
