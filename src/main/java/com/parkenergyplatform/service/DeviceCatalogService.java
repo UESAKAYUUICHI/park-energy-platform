@@ -2,7 +2,10 @@ package com.parkenergyplatform.service;
 
 import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.net.URL;
+import java.io.IOException;
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -11,18 +14,29 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 
 import cn.dev33.satoken.stp.StpUtil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.parkenergyplatform.common.BusinessException;
+import com.parkenergyplatform.config.ParkCosProperties;
+import com.qcloud.cos.COSClient;
+import com.qcloud.cos.model.DeleteObjectRequest;
+import com.qcloud.cos.http.HttpMethodName;
+import com.qcloud.cos.model.GeneratePresignedUrlRequest;
+import com.qcloud.cos.model.ObjectMetadata;
+import com.qcloud.cos.model.PutObjectRequest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
+import org.springframework.web.multipart.MultipartFile;
 
 @Service
 public class DeviceCatalogService {
@@ -34,47 +48,63 @@ public class DeviceCatalogService {
     private static final Set<String> MODBUS_VALUE_TYPES = Set.of("INT16", "UINT16", "INT32", "UINT32", "FLOAT32", "FLOAT64", "BOOLEAN");
     private static final Set<String> MODBUS_FUNCTION_CODES = Set.of("01", "02", "03", "04", "1", "2", "3", "4");
     private static final Set<String> BYTE_ORDERS = Set.of("AB", "BA", "ABCD", "CDAB", "BADC", "DCBA");
+    private static final Set<String> IMAGE_CONTENT_TYPES = Set.of("image/jpeg", "image/png", "image/webp", "image/gif");
 
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
+    private final ObjectProvider<COSClient> cosClientProvider;
+    private final ParkCosProperties cosProperties;
 
-    public DeviceCatalogService(JdbcTemplate jdbcTemplate, ObjectMapper objectMapper) {
+    public DeviceCatalogService(JdbcTemplate jdbcTemplate, ObjectMapper objectMapper,
+                                ObjectProvider<COSClient> cosClientProvider, ParkCosProperties cosProperties) {
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
+        this.cosClientProvider = cosClientProvider;
+        this.cosProperties = cosProperties;
     }
 
     public List<Map<String, Object>> tree(String keyword) {
-        List<Map<String, Object>> categories = jdbcTemplate.queryForList("""
+        return tree(keyword, null);
+    }
+
+    public List<Map<String, Object>> tree(String keyword, String depth) {
+        CompletableFuture<List<Map<String, Object>>> categoriesFuture = CompletableFuture.supplyAsync(() -> jdbcTemplate.queryForList("""
                 SELECT id, parent_id, category_code, category_name, description, enabled
                 FROM dev_device_category
                 WHERE enabled = 1
                 ORDER BY parent_id, sort, id
-                """);
-        List<Map<String, Object>> seriesRows = jdbcTemplate.queryForList("""
+                """));
+        CompletableFuture<List<Map<String, Object>>> seriesFuture = CompletableFuture.supplyAsync(() -> jdbcTemplate.queryForList("""
                 SELECT s.id, s.category_id, s.brand_id, s.series_code, s.series_name, s.description,
                        b.brand_code, b.brand_name
                 FROM dev_product_series s
                 JOIN dev_brand b ON b.id = s.brand_id
                 WHERE s.enabled = 1 AND b.enabled = 1
                 ORDER BY b.brand_name, s.series_name, s.id
-                """);
-        List<Map<String, Object>> categoryBrandRows = jdbcTemplate.queryForList("""
+                """));
+        CompletableFuture<List<Map<String, Object>>> categoryBrandsFuture = CompletableFuture.supplyAsync(() -> jdbcTemplate.queryForList("""
                 SELECT cb.category_id,b.id AS brand_id,b.brand_code,b.brand_name,b.description
                 FROM dev_device_category_brand cb
                 JOIN dev_brand b ON b.id=cb.brand_id
                 WHERE b.enabled=1
                 ORDER BY cb.category_id,b.brand_name,b.id
-                """);
-        List<Map<String, Object>> models = jdbcTemplate.queryForList("""
-                SELECT m.id, m.series_id, m.model_code, m.model_name, m.description, m.status,
+                """));
+        CompletableFuture<List<Map<String, Object>>> modelsFuture = CompletableFuture.supplyAsync(() -> jdbcTemplate.queryForList("""
+                SELECT m.id, m.series_id, m.model_code, m.model_name, m.description, m.image_object_key, m.status,
                        m.current_published_version_id
                 FROM dev_device_model m
                 ORDER BY m.model_name, m.id
-                """);
-        List<Map<String, Object>> versions = jdbcTemplate.queryForList("""
+                """));
+        CompletableFuture<List<Map<String, Object>>> versionsFuture = CompletableFuture.supplyAsync(() -> jdbcTemplate.queryForList("""
                 SELECT id,model_id,version_no,version_name,device_type_id,status
                 FROM dev_device_model_version ORDER BY model_id,version_no DESC
-                """);
+                """));
+        CompletableFuture.allOf(categoriesFuture, seriesFuture, categoryBrandsFuture, modelsFuture, versionsFuture).join();
+        List<Map<String, Object>> categories = categoriesFuture.join();
+        List<Map<String, Object>> seriesRows = seriesFuture.join();
+        List<Map<String, Object>> categoryBrandRows = categoryBrandsFuture.join();
+        List<Map<String, Object>> models = modelsFuture.join();
+        List<Map<String, Object>> versions = versionsFuture.join();
 
         Map<Long, Map<String, Object>> categoryNodes = new LinkedHashMap<>();
         List<Map<String, Object>> roots = new ArrayList<>();
@@ -91,6 +121,7 @@ public class DeviceCatalogService {
             Map<String, Object> parent = parentId == null || parentId == 0 ? null : categoryNodes.get(parentId);
             if (parent == null) roots.add(node); else children(parent).add(node);
         }
+        if ("category".equalsIgnoreCase(depth) && !StringUtils.hasText(keyword)) return roots;
 
         Map<Long, Map<String, Object>> seriesNodes = new LinkedHashMap<>();
         Map<String, Map<String, Object>> brandNodes = new LinkedHashMap<>();
@@ -137,6 +168,7 @@ public class DeviceCatalogService {
                     text(row.get("model_code")), text(row.get("status")));
             model.put("seriesId", row.get("series_id"));
             model.put("description", row.get("description"));
+            model.put("image_object_key", row.get("image_object_key"));
             model.put("versionId", row.get("current_published_version_id"));
             children(series).add(model);
             modelNodes.put(longValue(row.get("id")), model);
@@ -406,9 +438,9 @@ public class DeviceCatalogService {
                 if (count("SELECT COUNT(*) FROM dev_product_series WHERE id=? AND enabled=1", seriesId) == 0) {
                     throw new BusinessException("产品系列不存在或已停用");
                 }
-                jdbcTemplate.update("UPDATE dev_device_model SET series_id=?,model_code=?,model_name=?,description=? WHERE id=?",
+                jdbcTemplate.update("UPDATE dev_device_model SET series_id=?,model_code=?,model_name=?,description=?,image_object_key=? WHERE id=?",
                         seriesId, text(value(body, "modelCode", "model_code")), text(value(body, "modelName", "model_name")),
-                        text(value(body, "description")), id);
+                        text(value(body, "description")), text(value(body, "imageObjectKey", "image_object_key")), id);
                 return single("SELECT * FROM dev_device_model WHERE id=?", id);
             }
             case "ATTRIBUTE_GROUP" -> {
@@ -535,8 +567,9 @@ public class DeviceCatalogService {
                 """, seriesId);
         String modelCode = text(value(body, "modelCode", "model_code"));
         String modelName = text(value(body, "modelName", "model_name"));
-        long modelId = insert("INSERT INTO dev_device_model(series_id,model_code,model_name,description,status) VALUES(?,?,?,?,?)",
-                seriesId, modelCode, modelName, text(value(body, "description")), DRAFT);
+        long modelId = insert("INSERT INTO dev_device_model(series_id,model_code,model_name,description,image_object_key,status) VALUES(?,?,?,?,?,?)",
+                seriesId, modelCode, modelName, text(value(body, "description")),
+                text(value(body, "imageObjectKey", "image_object_key")), DRAFT);
         String technicalCode = technicalTypeCode(seriesId, modelCode, 1);
         long deviceTypeId = insert("INSERT INTO dev_device_type(type_code,type_name,protocol_type,description,enabled) VALUES(?,?,?,?,0)",
                 technicalCode, modelName + " V1", textOr(value(body, "protocolType", "protocol_type"), "JSON"),
@@ -563,6 +596,7 @@ public class DeviceCatalogService {
                 JOIN dev_device_category c ON c.id=s.category_id
                 WHERE m.id=?
                 """, modelId);
+        model.put("image_url", modelImagePreviewUrl(text(model.get("image_object_key"))));
         List<Map<String, Object>> versions = jdbcTemplate.queryForList("""
                 SELECT v.*, t.type_code, t.type_name, t.protocol_type,
                        (SELECT COUNT(*) FROM dev_device d WHERE d.model_version_id=v.id) AS reference_count
@@ -609,6 +643,85 @@ public class DeviceCatalogService {
                 WHERE d.model_version_id=? ORDER BY d.id DESC LIMIT 100
                 """, selectedVersionId));
         return data;
+    }
+
+    @Transactional
+    public Map<String, Object> modelImageUploadUrl(long modelId, Map<String, Object> body) {
+        Map<String, Object> model = single("""
+                SELECT m.*, s.series_code, s.series_name, b.brand_code, b.brand_name, c.category_code, c.category_name
+                FROM dev_device_model m
+                JOIN dev_product_series s ON s.id=m.series_id
+                JOIN dev_brand b ON b.id=s.brand_id
+                JOIN dev_device_category c ON c.id=s.category_id
+                WHERE m.id=?
+                """, modelId);
+        String fileName = text(value(body, "filename", "fileName"));
+        String contentType = text(value(body, "contentType", "content_type"));
+        long size = longOrDefault(value(body, "size", "fileSize"), 0);
+        requireText(fileName, "文件名不能为空");
+        requireText(contentType, "文件类型不能为空");
+        if (!IMAGE_CONTENT_TYPES.contains(contentType)) throw new BusinessException("仅支持 JPEG、PNG、WebP、GIF 图片");
+        if (size <= 0) throw new BusinessException("图片大小不能为空");
+        if (size > 5L * 1024 * 1024) throw new BusinessException("图片不能超过 5MB");
+        String ext = imageExtension(fileName, contentType);
+        String objectKey = normalizedObjectPrefix() + modelId + "/" + UUID.randomUUID().toString().replace("-", "") + "." + ext;
+        java.util.Date expiration = java.util.Date.from(Instant.now().plusSeconds(Math.max(60L, cosProperties.urlExpireSeconds())));
+        GeneratePresignedUrlRequest request = new GeneratePresignedUrlRequest(cosProperties.bucket(), objectKey, HttpMethodName.PUT);
+        request.setExpiration(expiration);
+        URL uploadUrl = cosClient().generatePresignedUrl(request);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("model", model);
+        result.put("objectKey", objectKey);
+        result.put("uploadUrl", uploadUrl.toString());
+        result.put("previewUrl", modelImagePreviewUrl(objectKey));
+        result.put("contentType", contentType);
+        result.put("expiresAt", expiration.toInstant().toString());
+        result.put("maxSizeBytes", 5L * 1024 * 1024);
+        return result;
+    }
+
+    @Transactional
+    public Map<String, Object> uploadModelImage(long modelId, MultipartFile file) {
+        if (file == null || file.isEmpty()) throw new BusinessException("图片文件不能为空");
+        String contentType = text(file.getContentType());
+        if (!IMAGE_CONTENT_TYPES.contains(contentType)) throw new BusinessException("仅支持 JPEG、PNG、WebP、GIF 图片");
+        if (file.getSize() > 5L * 1024 * 1024) throw new BusinessException("图片不能超过 5MB");
+        Map<String, Object> current = single("SELECT image_object_key FROM dev_device_model WHERE id=?", modelId);
+        String objectKey = normalizedObjectPrefix() + modelId + "/" + UUID.randomUUID().toString().replace("-", "")
+                + "." + imageExtension(textOr(file.getOriginalFilename(), "model-image"), contentType);
+        ObjectMetadata metadata = new ObjectMetadata();
+        metadata.setContentLength(file.getSize());
+        metadata.setContentType(contentType);
+        try {
+            cosClient().putObject(new PutObjectRequest(cosProperties.bucket(), objectKey, file.getInputStream(), metadata));
+        } catch (IOException exception) {
+            throw new BusinessException("读取图片文件失败");
+        } catch (RuntimeException exception) {
+            throw new BusinessException("图片上传对象存储失败: " + exception.getMessage());
+        }
+        jdbcTemplate.update("UPDATE dev_device_model SET image_object_key=? WHERE id=?", objectKey, modelId);
+        String oldObjectKey = text(current.get("image_object_key"));
+        if (!Objects.equals(oldObjectKey, objectKey)) deleteObjectQuietly(oldObjectKey);
+        return detail(modelId, null);
+    }
+
+    @Transactional
+    public Map<String, Object> saveModelImage(long modelId, Map<String, Object> body) {
+        String imageObjectKey = text(value(body, "imageObjectKey", "image_object_key"));
+        requireText(imageObjectKey, "图片对象键不能为空");
+        Map<String, Object> current = single("SELECT image_object_key FROM dev_device_model WHERE id=?", modelId);
+        jdbcTemplate.update("UPDATE dev_device_model SET image_object_key=? WHERE id=?", imageObjectKey, modelId);
+        String oldObjectKey = text(current.get("image_object_key"));
+        if (!Objects.equals(oldObjectKey, imageObjectKey)) deleteObjectQuietly(oldObjectKey);
+        return detail(modelId, null);
+    }
+
+    @Transactional
+    public Map<String, Object> clearModelImage(long modelId) {
+        Map<String, Object> current = single("SELECT image_object_key FROM dev_device_model WHERE id=?", modelId);
+        jdbcTemplate.update("UPDATE dev_device_model SET image_object_key=NULL WHERE id=?", modelId);
+        deleteObjectQuietly(text(current.get("image_object_key")));
+        return detail(modelId, null);
     }
 
     @Transactional
@@ -894,9 +1007,9 @@ public class DeviceCatalogService {
     }
 
     public List<Map<String, Object>> publishedOptions() {
-        return jdbcTemplate.queryForList("""
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList("""
                 SELECT v.id AS model_version_id,v.version_name,v.device_type_id,v.collect_interval_seconds,v.quality_threshold_pct,t.protocol_type,
-                       m.id AS model_id,m.model_code,m.model_name,s.series_name,b.brand_name,c.category_name,
+                       m.id AS model_id,m.model_code,m.model_name,m.image_object_key,s.series_name,b.brand_name,c.category_name,
                        (SELECT COUNT(*) FROM dev_model_attribute_value av WHERE av.model_version_id=v.id) AS attribute_count,
                        (SELECT COUNT(*) FROM dev_point_definition pd WHERE pd.device_type_id=v.device_type_id AND pd.enabled=1) AS point_count,
                        CONCAT(c.category_name,' / ',b.brand_name,' / ',s.series_name,' / ',m.model_name,' ',v.version_name) AS display_name
@@ -909,6 +1022,12 @@ public class DeviceCatalogService {
                 WHERE v.status='PUBLISHED' AND m.status<>'DISABLED' AND s.enabled=1 AND b.enabled=1 AND c.enabled=1
                 ORDER BY c.category_name,b.brand_name,s.series_name,m.model_name,v.version_no DESC
                 """);
+        rows.forEach(row -> row.put("image_url", modelImageUrl(text(row.get("image_object_key")))));
+        return rows;
+    }
+
+    public String modelImageUrl(String objectKey) {
+        return modelImagePreviewUrl(objectKey);
     }
 
     /**
@@ -1179,6 +1298,56 @@ public class DeviceCatalogService {
         String normalized = textOr(modelCode, "MODEL").toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9_-]", "_");
         String code = "CAT_" + seriesId + "_" + normalized + "_V" + versionNo;
         return code.length() > 64 ? code.substring(0, 64) : code;
+    }
+
+    private COSClient cosClient() {
+        COSClient client = cosClientProvider.getIfAvailable();
+        if (client == null) throw new BusinessException("COS 未启用，请先配置 park.cos.enabled=true 和密钥");
+        return client;
+    }
+
+    private String normalizedObjectPrefix() {
+        String prefix = textOr(cosProperties.objectPrefix(), "device-models/");
+        return prefix.endsWith("/") ? prefix : prefix + "/";
+    }
+
+    private String imageExtension(String fileName, String contentType) {
+        String lower = fileName.toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "jpg";
+        if (lower.endsWith(".png")) return "png";
+        if (lower.endsWith(".webp")) return "webp";
+        if (lower.endsWith(".gif")) return "gif";
+        return switch (contentType) {
+            case "image/jpeg" -> "jpg";
+            case "image/png" -> "png";
+            case "image/webp" -> "webp";
+            case "image/gif" -> "gif";
+            default -> throw new BusinessException("不支持的图片类型");
+        };
+    }
+
+    private String modelImagePreviewUrl(String objectKey) {
+        if (!StringUtils.hasText(objectKey)) return null;
+        try {
+            java.util.Date expiration = java.util.Date.from(Instant.now().plusSeconds(Math.max(60L, cosProperties.urlExpireSeconds())));
+            GeneratePresignedUrlRequest request = new GeneratePresignedUrlRequest(cosProperties.bucket(), objectKey, HttpMethodName.GET);
+            request.setExpiration(expiration);
+            return cosClient().generatePresignedUrl(request).toString();
+        } catch (RuntimeException exception) {
+            return null;
+        }
+    }
+
+    private void deleteObjectQuietly(String objectKey) {
+        if (!StringUtils.hasText(objectKey)) return;
+        try {
+            cosClient().deleteObject(new DeleteObjectRequest(cosProperties.bucket(), objectKey));
+        } catch (RuntimeException ignored) {
+        }
+    }
+
+    private void requireText(Object value, String message) {
+        if (!StringUtils.hasText(text(value))) throw new BusinessException(message);
     }
 
     private String camelToSnake(String value) {

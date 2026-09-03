@@ -54,11 +54,30 @@ public class SimpleTableService {
         String where = buildWhere(definition, params, args);
         where = appendDataScope(definition, where, args);
         Long total = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM " + definition.table() + where, Long.class, args.toArray());
-        String sql = "SELECT * FROM " + definition.table() + where + " ORDER BY id DESC LIMIT ? OFFSET ?";
+        String sql = "spaces".equals(resource)
+                ? "SELECT id, org_id, parent_id, space_code, space_name, space_type, status, create_time, "
+                + "(SELECT COUNT(*) FROM leasing_contract_space cs JOIN leasing_contract c ON c.id=cs.contract_id WHERE cs.space_id=park_space.id AND c.status='ACTIVE') AS active_contract_count, "
+                + "(SELECT COUNT(*) FROM dev_device d WHERE d.space_id=park_space.id) AS device_count "
+                + "FROM park_space" + where + " ORDER BY id DESC LIMIT ? OFFSET ?"
+                : "SELECT * FROM " + definition.table() + where + " ORDER BY id DESC LIMIT ? OFFSET ?";
         args.add(pageSize);
         args.add((pageNum - 1) * pageSize);
         List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, args.toArray());
+        enrichDeviceModelImages(resource, rows);
+        enrichBillingRuleConfigs(resource, rows);
         return PageResult.of(rows, total == null ? 0 : total, pageNum, pageSize);
+    }
+
+    public List<Map<String, Object>> options(String resource, Map<String, String> params) {
+        TableDefinition definition = tableRegistry.get(resource);
+        List<Object> args = new ArrayList<>();
+        String where = appendDataScope(definition, buildWhere(definition, params, args), args);
+        int limit = Math.min(parsePositive(params.get("limit"), 100), 200);
+        String columns = optionColumns(resource);
+        List<Object> queryArgs = new ArrayList<>(args);
+        queryArgs.add(limit);
+        return jdbcTemplate.queryForList("SELECT " + columns + " FROM " + definition.table()
+                + where + " ORDER BY id DESC LIMIT ?", queryArgs.toArray());
     }
 
     public Map<String, Object> get(String resource, long id) {
@@ -70,6 +89,8 @@ public class SimpleTableService {
         if (rows.isEmpty()) {
             throw new BusinessException(404, "数据不存在: " + id);
         }
+        enrichDeviceModelImages(resource, rows);
+        enrichBillingRuleConfigs(resource, rows);
         return rows.get(0);
     }
 
@@ -80,8 +101,18 @@ public class SimpleTableService {
         }
         TableDefinition definition = tableRegistry.get(resource);
         Map<String, Object> values = writableValues(definition, body, false);
+        // Row-level audit ownership is controlled by the server, never by a client supplied form value.
+        if (definition.hasColumn("create_by")) values.put("create_by", operatorName());
+        if (definition.hasColumn("update_by")) values.put("update_by", operatorName());
         applyDefaultDeviceOrg(definition, values);
         applyDefaultCollectionPolicy(definition, values);
+        if ("spaces".equals(resource) && values.get("parent_id") == null) values.put("parent_id", 0L);
+        if ("spaces".equals(resource)
+                && (values.get("space_type") == null || String.valueOf(values.get("space_type")).isBlank())) {
+            // 空间表中的类型是必填字段，而空间管理表单允许用户不填写类型。
+            // 默认按楼宇/园区空间处理，后续仍可通过编辑写入 FLOOR、ROOM 等类型。
+            values.put("space_type", "BUILDING");
+        }
         validateDeviceCollectionPolicy(definition, values);
         assertCatalogResourceWritable(resource, null, values);
         if (values.isEmpty()) {
@@ -106,6 +137,9 @@ public class SimpleTableService {
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
+        if ("billing-rules".equals(resource) && key != null) {
+            replaceBillingRuleConfigs(key.longValue(), body);
+        }
         return key == null ? values : get(resource, key.longValue());
     }
 
@@ -118,6 +152,8 @@ public class SimpleTableService {
         }
         assertCatalogResourceWritable(resource, id, current);
         Map<String, Object> values = writableValues(definition, body, true);
+        // Keep the original creator immutable while recording the actual editor for every generic archive update.
+        if (definition.hasColumn("update_by")) values.put("update_by", operatorName());
         if ("devices".equals(resource)) {
             Long currentTypeId = longOrNull(current.get("device_type_id"));
             Long requestedTypeId = longOrNull(values.get("device_type_id"));
@@ -166,7 +202,83 @@ public class SimpleTableService {
         });
         args.add(id);
         jdbcTemplate.update("UPDATE " + definition.table() + " SET " + sets + " WHERE id = ?", args.toArray());
+        if ("billing-rules".equals(resource)) {
+            replaceBillingRuleConfigs(id, body);
+        }
         return get(resource, id);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void replaceBillingRuleConfigs(long ruleId, Map<String, Object> body) {
+        Object raw = body.get("device_configs");
+        if (!(raw instanceof List<?> configs)) return;
+        jdbcTemplate.update("DELETE FROM billing_rule_point_config WHERE rule_id = ?", ruleId);
+        int sort = 1;
+        for (Object value : configs) {
+            if (!(value instanceof Map<?, ?> item)) continue;
+            Object typeId = item.get("deviceTypeId");
+            Object rawPoints = item.get("pointCodes");
+            if (typeId == null || !(rawPoints instanceof List<?> pointCodes)) continue;
+            for (Object point : pointCodes) {
+                String code = Objects.toString(point, "").trim();
+                if (code.isBlank()) continue;
+                List<String> pointNames = jdbcTemplate.queryForList(
+                        "SELECT point_name FROM dev_point_definition WHERE device_type_id=? AND point_code=? LIMIT 1",
+                        String.class, Long.parseLong(String.valueOf(typeId)), code);
+                String pointName = pointNames.isEmpty() ? code : pointNames.get(0);
+                jdbcTemplate.update("""
+                        INSERT INTO billing_rule_point_config
+                          (rule_id, device_type_id, point_code, point_name, sort_no, enabled)
+                        VALUES (?, ?, ?, ?, ?, 1)
+                        """, ruleId, Long.parseLong(String.valueOf(typeId)), code, pointName, sort++);
+            }
+        }
+    }
+
+    private void enrichBillingRuleConfigs(String resource, List<Map<String, Object>> rows) {
+        if (!"billing-rules".equals(resource)) return;
+        List<Long> ruleIds = rows.stream()
+                .map(row -> longOrNull(row.get("id")))
+                .filter(Objects::nonNull)
+                .toList();
+        if (ruleIds.isEmpty()) return;
+        String placeholders = String.join(",", java.util.Collections.nCopies(ruleIds.size(), "?"));
+        List<Map<String, Object>> allConfigs = jdbcTemplate.queryForList("""
+                SELECT c.rule_id, c.device_type_id, t.type_name AS device_type_name, c.point_code, c.point_name
+                FROM billing_rule_point_config c
+                LEFT JOIN dev_device_type t ON t.id=c.device_type_id
+                WHERE c.rule_id IN (%s) AND c.enabled=1
+                ORDER BY c.rule_id, c.sort_no, c.id
+                """.formatted(placeholders), ruleIds.toArray());
+        Map<Long, List<Map<String, Object>>> configsByRuleId = new LinkedHashMap<>();
+        for (Map<String, Object> config : allConfigs) {
+            Long ruleId = longOrNull(config.get("rule_id"));
+            if (ruleId != null) configsByRuleId.computeIfAbsent(ruleId, ignored -> new ArrayList<>()).add(config);
+        }
+        for (Map<String, Object> row : rows) {
+            Long ruleId = longOrNull(row.get("id"));
+            if (ruleId == null) continue;
+            List<Map<String, Object>> configs = configsByRuleId.getOrDefault(ruleId, List.of());
+            row.put("device_configs", configs);
+            if (!configs.isEmpty()) {
+                row.put("device_type_name", configs.stream().map(x -> Objects.toString(x.get("device_type_name"), "—")).distinct().reduce((a, b) -> a + "、" + b).orElse("—"));
+                row.put("metric_point_code", configs.stream().map(x -> Objects.toString(x.get("point_code"), "")).filter(x -> !x.isBlank()).distinct().reduce((a, b) -> a + "," + b).orElse(""));
+            }
+        }
+    }
+
+    private String optionColumns(String resource) {
+        return switch (resource) {
+            case "orgs" -> "id, parent_id, org_name, org_type";
+            case "gateways" -> "id, gateway_sn, gateway_name, org_id, status, online_status";
+            case "devices" -> "id, device_sn, device_name, gateway_id, org_id, space_id, device_type_id, status";
+            case "device-types" -> "id, type_code, type_name, protocol_type, enabled";
+            case "spaces" -> "id, org_id, parent_id, space_code, space_name, space_type, status";
+            case "point-definitions" -> "id, device_type_id, point_code, point_name, unit, enabled";
+            case "billing-accounts" -> "id, account_name, org_id, status";
+            case "billing-rules" -> "id, account_id, rule_name, device_type_id, metric_point_code, enabled";
+            default -> "id";
+        };
     }
 
     @Transactional
@@ -175,6 +287,11 @@ public class SimpleTableService {
         Map<String, Object> current = get(resource, id);
         assertCatalogResourceWritable(resource, id, current);
         assertDeleteChain(resource, id);
+        // 计费空间的设备范围映射属于空间的业务子记录。数据库外键默认不级联，
+        // 删除空间前必须先清理映射，否则会被 billing_space_scope 外键拦截并返回 500。
+        if ("spaces".equals(resource)) {
+            jdbcTemplate.update("DELETE FROM billing_space_scope WHERE space_id = ?", id);
+        }
         jdbcTemplate.update("DELETE FROM " + definition.table() + " WHERE id = ?", id);
     }
 
@@ -203,6 +320,22 @@ public class SimpleTableService {
             values.put("quality_gate_start_date", LocalDate.now());
         }
         return create(resource, values);
+    }
+
+    private String operatorName() {
+        if (!StpUtil.isLogin()) return "system";
+        try {
+            Long userId = StpUtil.getLoginIdAsLong();
+            List<Map<String, Object>> users = jdbcTemplate.queryForList(
+                    "SELECT nickname, username FROM sys_user WHERE id=?", userId);
+            if (users.isEmpty()) return "user-" + userId;
+            Map<String, Object> user = users.get(0);
+            String nickname = Objects.toString(user.get("nickname"), "").trim();
+            return nickname.isBlank() ? Objects.toString(user.get("username"), "user-" + userId) : nickname;
+        } catch (RuntimeException ignored) {
+            // Background calls and isolated tests have no request-bound Sa-Token context.
+            return "system";
+        }
     }
 
     @Transactional
@@ -278,6 +411,14 @@ public class SimpleTableService {
                         || count("SELECT COUNT(*) FROM billing_bill_detail WHERE device_id = ?", id) > 0
                         || count("SELECT COUNT(*) FROM billing_meter_change_order WHERE source_device_id = ? OR target_device_id = ?", id, id) > 0) {
                     throw new BusinessException("设备已有告警、指令、工单、账单或计量变更记录，不能删除；请改为停用设备");
+                }
+            }
+            case "spaces" -> {
+                if (count("SELECT COUNT(*) FROM park_space WHERE parent_id = ?", id) > 0
+                        || count("SELECT COUNT(*) FROM dev_device WHERE space_id = ?", id) > 0
+                        || count("SELECT COUNT(*) FROM leasing_contract_space WHERE space_id = ?", id) > 0
+                        || count("SELECT COUNT(*) FROM alarm_rule WHERE space_id = ?", id) > 0) {
+                    throw new BusinessException("该空间仍被子空间、设备、合同或告警规则引用，不能删除；请保留并停用空间");
                 }
             }
             default -> {
@@ -639,6 +780,10 @@ public class SimpleTableService {
         }
         Long orgId = longOrNull(params.get("orgId"));
         boolean includeChildren = Boolean.parseBoolean(Objects.toString(params.getOrDefault("includeChildren", "false")));
+        List<Long> orgIds = commaSeparatedLongs(params.get("orgIds"));
+        if (!orgIds.isEmpty()) {
+            return accessService.orgFilterSql(definition.table() + "." + definition.dataScopeColumn(), orgIds, includeChildren, args);
+        }
         return accessService.orgFilterSql(definition.table() + "." + definition.dataScopeColumn(), orgId, includeChildren, args);
     }
 
@@ -666,7 +811,22 @@ public class SimpleTableService {
     }
 
     private boolean isReservedParam(String key) {
-        return "pageNum".equals(key) || "pageSize".equals(key) || "keyword".equals(key) || "includeChildren".equals(key);
+        return "pageNum".equals(key) || "pageSize".equals(key) || "keyword".equals(key)
+                || "includeChildren".equals(key) || "orgIds".equals(key);
+    }
+
+    private List<Long> commaSeparatedLongs(String value) {
+        if (value == null || value.isBlank()) {
+            return List.of();
+        }
+        return java.util.Arrays.stream(value.split(","))
+                .map(String::trim)
+                .filter(item -> !item.isBlank())
+                .map(this::longOrNull)
+                .filter(Objects::nonNull)
+                .distinct()
+                .limit(100)
+                .toList();
     }
 
     private int parsePositive(String input, int defaultValue) {
@@ -701,6 +861,30 @@ public class SimpleTableService {
 
     private String placeholders(int size) {
         return String.join(",", java.util.Collections.nCopies(size, "?"));
+    }
+
+    private void enrichDeviceModelImages(String resource, List<Map<String, Object>> rows) {
+        if (!"devices".equals(resource) || rows.isEmpty()) return;
+        Set<Long> versionIds = new java.util.LinkedHashSet<>();
+        for (Map<String, Object> row : rows) {
+            Long versionId = longOrNull(row.get("model_version_id"));
+            if (versionId != null) versionIds.add(versionId);
+        }
+        if (versionIds.isEmpty()) return;
+        List<Map<String, Object>> images = jdbcTemplate.queryForList("""
+                SELECT v.id AS model_version_id, m.image_object_key
+                FROM dev_device_model_version v
+                JOIN dev_device_model m ON m.id = v.model_id
+                WHERE v.id IN (
+                """ + placeholders(versionIds.size()) + ")", versionIds.toArray());
+        Map<String, String> imageByVersion = new LinkedHashMap<>();
+        for (Map<String, Object> image : images) {
+            imageByVersion.put(Objects.toString(image.get("model_version_id"), ""),
+                    deviceCatalogService.modelImageUrl(Objects.toString(image.get("image_object_key"), "")));
+        }
+        for (Map<String, Object> row : rows) {
+            row.put("model_image_url", imageByVersion.getOrDefault(Objects.toString(row.get("model_version_id"), ""), ""));
+        }
     }
 
     private String toSnake(String input) {

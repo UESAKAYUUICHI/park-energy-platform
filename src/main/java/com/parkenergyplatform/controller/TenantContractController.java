@@ -34,5 +34,7 @@ public class TenantContractController {
     public ApiResponse<Map<String,Object>> activate(@PathVariable long id) { return ApiResponse.success(contractService.activate(id)); }
     @PostMapping("/{id}/terminate") @SaCheckPermission("billing:contract:edit") @OperationLog(module="园区经营",operation="终止租户合同")
     public ApiResponse<Map<String,Object>> terminate(@PathVariable long id,@RequestBody Map<String,Object> body) { return ApiResponse.success(contractService.terminate(id,body)); }
+    @PostMapping("/{id}/delete") @SaCheckPermission("billing:contract:edit") @OperationLog(module="园区经营",operation="删除已终止租户合同")
+    public ApiResponse<Void> delete(@PathVariable long id) { contractService.delete(id); return ApiResponse.success(null); }
     private Map<String,String> params(HttpServletRequest r) { return r.getParameterMap().entrySet().stream().collect(java.util.stream.Collectors.toMap(Map.Entry::getKey,e->e.getValue()[0])); }
 }

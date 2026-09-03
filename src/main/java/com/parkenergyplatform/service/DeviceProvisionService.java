@@ -4,6 +4,7 @@ import java.math.BigDecimal;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.LocalDateTime;
+import java.time.LocalDate;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -77,7 +78,7 @@ public class DeviceProvisionService {
         Long spaceId = longValue(value(body, "spaceId", "space_id"));
         String installLocation = text(value(body, "installLocation", "install_location"));
         String installTime = text(value(body, "installTime", "install_time"));
-        String qualityGateDate = text(value(body, "qualityGateStartDate", "quality_gate_start_date"));
+        String qualityGateDate = normalizeDate(text(value(body, "qualityGateStartDate", "quality_gate_start_date")), "质量门禁日期");
         if (!StringUtils.hasText(qualityGateDate)) qualityGateDate = LocalDateTime.now().toLocalDate().toString();
         long collectInterval = longOrDefault(version.get("collect_interval_seconds"), 300);
         BigDecimal qualityThreshold = decimal(version.get("quality_threshold_pct"), new BigDecimal("95"));
@@ -147,7 +148,7 @@ public class DeviceProvisionService {
         validateCommissioning(settlementEnabled, gatewayId, longValue(device.get("device_type_id")), meterRole, meterFactor);
         String installLocation = bodyText(body, device, "installLocation", "install_location");
         String installTime = bodyText(body, device, "installTime", "install_time");
-        String qualityGateDate = bodyText(body, device, "qualityGateStartDate", "quality_gate_start_date");
+        String qualityGateDate = normalizeDate(bodyText(body, device, "qualityGateStartDate", "quality_gate_start_date"), "质量门禁日期");
 
         Long sourceGatewayId = longValue(device.get("gateway_id"));
         String sourceAddress = text(device.get("protocol_addr"));
@@ -291,7 +292,7 @@ public class DeviceProvisionService {
         if (deviceStatus == 1) {
             Long duplicate = jdbcTemplate.queryForObject("""
                     SELECT COUNT(*) FROM dev_device
-                    WHERE gateway_id=? AND protocol_addr=? AND status=1 AND (? IS NULL OR id<>?)
+                    WHERE gateway_id=? AND BINARY protocol_addr=BINARY ? AND status=1 AND (? IS NULL OR id<>?)
                     """, Long.class, gatewayId, protocolAddress, currentDeviceId, currentDeviceId);
             if (duplicate != null && duplicate > 0) throw new BusinessException("同一网关下 MODBUS 从站地址不能重复");
         }
@@ -390,6 +391,17 @@ public class DeviceProvisionService {
 
     private Object blankToNull(String value) {
         return StringUtils.hasText(value) ? value : null;
+    }
+
+    /** HTML date fields need a calendar date, while JDBC map rows are serialized as ISO instants. */
+    private String normalizeDate(String value, String label) {
+        if (!StringUtils.hasText(value)) return null;
+        String datePart = value.trim().length() >= 10 ? value.trim().substring(0, 10) : value.trim();
+        try {
+            return LocalDate.parse(datePart).toString();
+        } catch (Exception exception) {
+            throw new BusinessException(label + "格式不合法，应为 YYYY-MM-DD");
+        }
     }
 
     private Long longValue(Object value) {

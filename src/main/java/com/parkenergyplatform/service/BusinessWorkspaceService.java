@@ -54,18 +54,36 @@ public class BusinessWorkspaceService {
                 LIMIT 12
                 """, deviceHealthArgs.toArray());
         }, List.of());
+        putSafely(data, "deviceStatusSummary", () -> {
+            List<Object> statusArgs = new ArrayList<>();
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList("""
+                SELECT COUNT(*) AS total_count,
+                       SUM(CASE WHEN d.status = 1 AND COALESCE(g.online_status, 0) = 1 THEN 1 ELSE 0 END) AS online_count,
+                       SUM(CASE WHEN d.status <> 1 OR COALESCE(g.online_status, 0) <> 1 THEN 1 ELSE 0 END) AS offline_count
+                FROM dev_device d
+                LEFT JOIN dev_gateway g ON g.id = d.gateway_id
+                WHERE 1 = 1
+                """ + scopeSql("d.org_id", statusArgs, rootOrgId), statusArgs.toArray());
+            return rows.isEmpty() ? Map.of() : rows.get(0);
+        }, Map.of("totalCount", 0, "onlineCount", 0, "offlineCount", 0));
         putSafely(data, "energyTrend", () -> {
             List<Object> trendArgs = new ArrayList<>();
             trendArgs.add(java.sql.Date.valueOf(LocalDate.now().minusDays(14)));
             return jdbcTemplate.queryForList("""
-                SELECT stat_date, ROUND(SUM(COALESCE(usage_value, 0)), 4) AS usage_value
-                FROM stats_daily_point
-                WHERE stat_date >= ?
-                """ + scopeSql("org_id", trendArgs, rootOrgId) + """
-                GROUP BY stat_date
-                ORDER BY stat_date
+                SELECT s.stat_date, ROUND(SUM(COALESCE(s.usage_value, 0)), 4) AS usage_value
+                FROM stats_daily_point s
+                JOIN dev_point_definition p ON p.device_type_id = s.device_type_id
+                  AND p.point_code = s.point_code
+                  AND p.business_role = 'TOTAL_ACCUMULATED'
+                WHERE s.stat_date >= ?
+                """ + scopeSql("s.org_id", trendArgs, rootOrgId) + """
+                GROUP BY s.stat_date
+                ORDER BY s.stat_date
                 """, trendArgs.toArray());
         }, List.of());
+        putSafely(data, "hourlyTrend", () -> hourlyTrend(rootOrgId), List.of());
+        putSafely(data, "qualitySummary", () -> qualitySummary(rootOrgId), Map.of(
+                "completeRate", BigDecimal.ZERO, "expectedSamples", 0, "receivedSamples", 0));
         putSafely(data, "latestAlarms", () -> alarmEvents(6, null, rootOrgId), List.of());
         putSafely(data, "latestBills", () -> {
             List<Object> billArgs = new ArrayList<>();
@@ -110,10 +128,13 @@ public class BusinessWorkspaceService {
         dailyArgs.add(blankToNull(pointCode));
         dailyArgs.add(blankToNull(pointCode));
         data.put("dailyStats", jdbcTemplate.queryForList("""
-                SELECT s.*, d.device_name, o.org_name
+                SELECT s.*, d.device_name, o.org_name,
+                       COALESCE(c.data_complete_rate, 0) AS collection_complete_rate,
+                       c.quality_status AS collection_quality_status
                 FROM stats_daily_point s
                 LEFT JOIN dev_device d ON d.id = s.device_id
                 LEFT JOIN dev_org o ON o.id = s.org_id
+                LEFT JOIN stats_collection_daily c ON c.device_id = s.device_id AND c.stat_date = s.stat_date
                 WHERE (? IS NULL OR s.device_id = ?) AND (? IS NULL OR s.point_code = ?)
                 """ + scopeSql("s.org_id", dailyArgs) + """
                 ORDER BY s.stat_date DESC, s.id DESC
@@ -256,27 +277,100 @@ public class BusinessWorkspaceService {
     }
 
     private Map<String, Object> metrics(Long rootOrgId) {
+        // The dashboard used to execute eleven independent aggregate queries here.
+        // The database is remote in this deployment, so round-trip latency dominated
+        // even when every individual aggregate was fast. Keep the same result shape
+        // while fetching all dashboard metrics in one request.
+        List<Object> args = new ArrayList<>();
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList("""
+                SELECT
+                  (SELECT COUNT(*) FROM dev_org WHERE 1 = 1 %s) AS org_count,
+                  (SELECT COUNT(*) FROM dev_gateway WHERE 1 = 1 %s) AS gateway_count,
+                  (SELECT COUNT(*) FROM dev_gateway WHERE online_status = 1 %s) AS online_gateway_count,
+                  (SELECT COUNT(*) FROM dev_device WHERE 1 = 1 %s) AS device_count,
+                  (SELECT COUNT(*) FROM dev_device WHERE status = 1 %s) AS enabled_device_count,
+                  (SELECT COUNT(*) FROM dev_point_definition) AS point_count,
+                  (SELECT COUNT(*) FROM dev_point_definition WHERE billable = 1) AS billable_point_count,
+                  (SELECT COUNT(*) FROM log_alarm WHERE deal_status = 0 %s) AS pending_alarm_count,
+                  (SELECT COUNT(*) FROM billing_bill b JOIN billing_account a ON a.id = b.account_id
+                   WHERE b.pay_status = 0 %s) AS unpaid_bill_count,
+                  (SELECT COALESCE(SUM(b.total_amount), 0) FROM billing_bill b JOIN billing_account a ON a.id = b.account_id
+                   WHERE b.pay_status IN (0, 2) %s) AS total_receivable,
+                  (SELECT COALESCE(SUM(s.usage_value), 0)
+                   FROM stats_daily_point s
+                   JOIN dev_point_definition p ON p.device_type_id = s.device_type_id
+                     AND p.point_code = s.point_code AND p.business_role = 'TOTAL_ACCUMULATED'
+                   WHERE s.stat_date = CURDATE() %s) AS today_usage
+                """.formatted(
+                scopeSql("id", args, rootOrgId),
+                scopeSql("org_id", args, rootOrgId),
+                scopeSql("org_id", args, rootOrgId),
+                scopeSql("org_id", args, rootOrgId),
+                scopeSql("org_id", args, rootOrgId),
+                scopeSql("org_id", args, rootOrgId),
+                scopeSql("a.org_id", args, rootOrgId),
+                scopeSql("a.org_id", args, rootOrgId),
+                scopeSql("s.org_id", args, rootOrgId)), args.toArray());
+        Map<String, Object> row = rows.isEmpty() ? Map.of() : rows.get(0);
         Map<String, Object> metrics = new LinkedHashMap<>();
-        putMetric(metrics, "orgCount", () -> countScoped("dev_org", "id", rootOrgId), 0L);
-        putMetric(metrics, "gatewayCount", () -> countScoped("dev_gateway", "org_id", rootOrgId), 0L);
-        putMetric(metrics, "onlineGatewayCount", () -> countWhereScoped("dev_gateway", "org_id", "online_status = 1", rootOrgId), 0L);
-        putMetric(metrics, "deviceCount", () -> countScoped("dev_device", "org_id", rootOrgId), 0L);
-        putMetric(metrics, "enabledDeviceCount", () -> countWhereScoped("dev_device", "org_id", "status = 1", rootOrgId), 0L);
-        putMetric(metrics, "pointCount", () -> count("dev_point_definition"), 0L);
-        putMetric(metrics, "billablePointCount", () -> countWhere("dev_point_definition", "billable = 1"), 0L);
-        putMetric(metrics, "pendingAlarmCount", () -> countWhereScoped("log_alarm", "org_id", "deal_status = 0", rootOrgId), 0L);
-        putMetric(metrics, "unpaidBillCount", () -> billingBillCount("b.pay_status = 0", rootOrgId), 0L);
-        putMetric(metrics, "totalReceivable", () -> billingBillSum("b.pay_status IN (0,2)", rootOrgId), BigDecimal.ZERO);
-        putMetric(metrics, "todayUsage", () -> sumScoped("stats_daily_point", "usage_value", "org_id", "stat_date = CURDATE()", rootOrgId), BigDecimal.ZERO);
+        metrics.put("orgCount", numberOrZero(row.get("org_count")).longValue());
+        metrics.put("gatewayCount", numberOrZero(row.get("gateway_count")).longValue());
+        metrics.put("onlineGatewayCount", numberOrZero(row.get("online_gateway_count")).longValue());
+        metrics.put("deviceCount", numberOrZero(row.get("device_count")).longValue());
+        metrics.put("enabledDeviceCount", numberOrZero(row.get("enabled_device_count")).longValue());
+        metrics.put("pointCount", numberOrZero(row.get("point_count")).longValue());
+        metrics.put("billablePointCount", numberOrZero(row.get("billable_point_count")).longValue());
+        metrics.put("pendingAlarmCount", numberOrZero(row.get("pending_alarm_count")).longValue());
+        metrics.put("unpaidBillCount", numberOrZero(row.get("unpaid_bill_count")).longValue());
+        metrics.put("totalReceivable", decimal(row.get("total_receivable")));
+        metrics.put("todayUsage", decimal(row.get("today_usage")));
         return metrics;
     }
 
-    private void putMetric(Map<String, Object> metrics, String key, Supplier<Object> supplier, Object fallback) {
-        try {
-            metrics.put(key, supplier.get());
-        } catch (Exception ex) {
-            metrics.put(key, fallback);
-        }
+    private BigDecimal todayEnergyUsage(Long rootOrgId) {
+        List<Object> args = new ArrayList<>();
+        BigDecimal value = jdbcTemplate.queryForObject("""
+                SELECT COALESCE(SUM(s.usage_value), 0)
+                FROM stats_daily_point s
+                JOIN dev_point_definition p ON p.device_type_id = s.device_type_id
+                  AND p.point_code = s.point_code
+                  AND p.business_role = 'TOTAL_ACCUMULATED'
+                WHERE s.stat_date = CURDATE()
+                """ + scopeSql("s.org_id", args, rootOrgId), BigDecimal.class, args.toArray());
+        return value == null ? BigDecimal.ZERO : value;
+    }
+
+    private List<Map<String, Object>> hourlyTrend(Long rootOrgId) {
+        List<Object> args = new ArrayList<>();
+        return jdbcTemplate.queryForList("""
+                SELECT h.stat_hour, ROUND(SUM(COALESCE(h.usage_value, 0)), 4) AS usage_value,
+                       SUM(h.sample_count) AS sample_count,
+                       SUM(h.expected_samples) AS expected_samples,
+                       ROUND(COALESCE(SUM(h.sample_count) * 100.00 /
+                         NULLIF(SUM(h.expected_samples), 0), 0), 2) AS complete_rate
+                FROM stats_hourly_point h
+                JOIN dev_point_definition p ON p.device_type_id = h.device_type_id
+                  AND p.point_code = h.point_code
+                  AND p.business_role = 'TOTAL_ACCUMULATED'
+                WHERE h.stat_date = CURDATE()
+                """ + scopeSql("h.org_id", args, rootOrgId) + """
+                GROUP BY h.stat_hour
+                ORDER BY h.stat_hour
+                """, args.toArray());
+    }
+
+    private Map<String, Object> qualitySummary(Long rootOrgId) {
+        List<Object> args = new ArrayList<>();
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList("""
+                SELECT COALESCE(SUM(c.expected_samples), 0) AS expected_samples,
+                       COALESCE(SUM(c.received_samples), 0) AS received_samples,
+                       ROUND(COALESCE(SUM(c.received_samples) * 100.00 /
+                         NULLIF(SUM(c.expected_samples), 0), 0), 2) AS complete_rate,
+                       SUM(CASE WHEN c.quality_status NOT IN ('GOOD', 'NORMAL') THEN 1 ELSE 0 END) AS abnormal_device_count
+                FROM stats_collection_daily c
+                WHERE c.stat_date = CURDATE()
+                """ + scopeSql("c.org_id", args, rootOrgId), args.toArray());
+        return rows.isEmpty() ? Map.of() : rows.get(0);
     }
 
     private List<Map<String, Object>> deviceRows() {
@@ -341,9 +435,9 @@ public class BusinessWorkspaceService {
                 """, deviceId);
     }
 
-    private Map<String, Object> safeRemoteData(String uri) {
+    private Object safeRemoteData(String uri) {
         try {
-            return remoteServiceClient.getData(uri);
+            return remoteServiceClient.getDataPayload(uri);
         } catch (Exception ex) {
             return Map.of("code", 503, "message", "data 服务暂不可用: " + ex.getMessage());
         }
@@ -361,14 +455,23 @@ public class BusinessWorkspaceService {
         StringJoiner joiner = new StringJoiner("&", "?", "");
         joiner.add("deviceId=" + deviceId);
         joiner.add("pointCode=" + encode(StringUtils.hasText(pointCode) ? pointCode : defaultPointCode(deviceId)));
-        joiner.add("startTime=" + encode(LocalDate.now().minusDays(1) + "T00:00:00"));
-        joiner.add("endTime=" + encode(LocalDate.now().plusDays(1) + "T00:00:00"));
+        joiner.add("startTime=" + encode(LocalDate.now().minusDays(1) + "T00:00:00+08:00"));
+        joiner.add("endTime=" + encode(LocalDate.now().plusDays(1) + "T00:00:00+08:00"));
         return joiner.toString();
     }
 
     private String defaultPointCode(Long deviceId) {
         List<Map<String, Object>> points = pointsForDevice(deviceId);
-        return points.isEmpty() ? "total_active_energy" : Objects.toString(points.get(0).get("point_code"));
+        return points.stream()
+                .map(point -> Objects.toString(point.get("point_code"), ""))
+                .filter("ACTIVE_POWER_TOTAL"::equals)
+                .findFirst()
+                .orElseGet(() -> points.stream()
+                        .map(point -> Objects.toString(point.get("point_code"), ""))
+                        .filter("FORWARD_ACTIVE_ENERGY"::equals)
+                        .findFirst()
+                        .orElse(points.isEmpty() ? "ACTIVE_POWER_TOTAL"
+                                : Objects.toString(points.get(0).get("point_code"))));
     }
 
     private String encode(String value) {
