@@ -562,7 +562,7 @@ public class BillingService {
         LocalDate checkedStart = startDate.isBefore(gateStart) ? gateStart : startDate;
         if (checkedStart.isAfter(endDate)) return List.of();
         int interval = boundedInt(device.get("collect_interval_seconds"), 300, 10, 86_400);
-        BigDecimal threshold = decimalOr(device.get("quality_threshold_pct"), BigDecimal.valueOf(95));
+        BigDecimal threshold = decimalOr(device.get("quality_threshold_pct"), BigDecimal.valueOf(80));
         long deviceId = number(device.get("id")).longValue();
         List<Map<String, Object>> dailyRows = jdbcTemplate.queryForList("""
                 SELECT stat_date, received_samples, longest_gap_seconds, quality_status
@@ -631,7 +631,7 @@ public class BillingService {
         LocalDate checkedStart = startDate.isBefore(gateStart) ? gateStart : startDate;
         if (checkedStart.isAfter(endDate)) return;
         int interval = boundedInt(device.get("collect_interval_seconds"), 300, 10, 86_400);
-        BigDecimal threshold = decimalOr(device.get("quality_threshold_pct"), BigDecimal.valueOf(95));
+        BigDecimal threshold = decimalOr(device.get("quality_threshold_pct"), BigDecimal.valueOf(80));
         long deviceId = number(device.get("id")).longValue();
         List<Map<String, Object>> dailyRows = jdbcTemplate.queryForList("""
                 SELECT stat_date, received_samples, longest_gap_seconds, quality_status
@@ -1015,7 +1015,7 @@ public class BillingService {
         long deviceTypeId = number(device.get("device_type_id")).longValue();
         long deviceOrgId = number(device.get("org_id")).longValue();
         long ruleId = number(rule.get("id")).longValue();
-        BigDecimal qualityThreshold = decimalOr(device.get("quality_threshold_pct"), BigDecimal.valueOf(95));
+        BigDecimal qualityThreshold = decimalOr(device.get("quality_threshold_pct"), BigDecimal.valueOf(80));
         Long explicitPlanId = longOrNull(rule.get("tariff_plan_id"));
         List<Map<String, Object>> rows = jdbcTemplate.queryForList("""
                 SELECT s.*, p.plan_code, p.plan_name

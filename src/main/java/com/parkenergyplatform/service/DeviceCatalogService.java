@@ -579,7 +579,7 @@ public class DeviceCatalogService {
                 (model_id,version_no,version_name,device_type_id,status,collect_interval_seconds,quality_threshold_pct,remark)
                 VALUES(?,1,'V1',?,'DRAFT',?,?,?)
                 """, modelId, deviceTypeId, longOrDefault(value(body, "collectIntervalSeconds"), 300),
-                decimalText(value(body, "qualityThresholdPct"), "95"), text(value(body, "remark")));
+                decimalText(value(body, "qualityThresholdPct"), "80"), text(value(body, "remark")));
         Map<String, Object> result = detail(modelId, versionId);
         result.put("series", series);
         return result;

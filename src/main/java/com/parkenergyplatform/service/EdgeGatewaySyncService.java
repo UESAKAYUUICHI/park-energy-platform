@@ -27,14 +27,6 @@ public class EdgeGatewaySyncService {
     public Map<String, Object> pull(String gatewaySn, String gatewaySecret) {
         Map<String, Object> gateway = authenticate(gatewaySn, gatewaySecret);
         long gatewayId = ((Number) gateway.get("id")).longValue();
-        long revision = desiredRevision(gatewayId);
-        jdbcTemplate.update("""
-                INSERT INTO dev_gateway_config_state(gateway_id,desired_revision,apply_status,last_sync_time)
-                VALUES (?,?,'PENDING',NOW())
-                ON DUPLICATE KEY UPDATE desired_revision=VALUES(desired_revision),last_sync_time=NOW(),
-                  apply_status=IF(applied_revision=VALUES(desired_revision),'APPLIED','PENDING')
-                """, gatewayId, revision);
-
         List<Map<String, Object>> devices = jdbcTemplate.queryForList("""
                 SELECT d.id AS platformDeviceId,d.device_sn AS deviceSn,d.device_name AS deviceName,
                        CAST(d.protocol_addr AS UNSIGNED) AS modbusAddr,d.edge_channel_id AS channelId,
@@ -69,10 +61,20 @@ public class EdgeGatewaySyncService {
             models.add(item);
         }
         normalizeAndValidateDevices(devices);
+        String checksum = configChecksum(gateway, devices, models);
+        long revision = revisionFromChecksum(checksum);
+        jdbcTemplate.update("""
+                INSERT INTO dev_gateway_config_state(gateway_id,desired_revision,desired_checksum,apply_status,last_sync_time)
+                VALUES (?,?,?,'PENDING',NOW())
+                ON DUPLICATE KEY UPDATE desired_revision=VALUES(desired_revision),last_sync_time=NOW(),
+                  desired_checksum=VALUES(desired_checksum),
+                  apply_status=IF(applied_revision=VALUES(desired_revision),'APPLIED','PENDING')
+                """, gatewayId, revision, checksum);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("gatewayId", gatewayId);
         result.put("gatewaySn", gateway.get("gateway_sn"));
         result.put("desiredRevision", String.valueOf(revision));
+        result.put("configChecksum", checksum);
         result.put("devices", devices);
         result.put("models", models);
         return result;
@@ -109,17 +111,46 @@ public class EdgeGatewaySyncService {
         Map<String, Object> gateway = authenticate(gatewaySn, gatewaySecret);
         long gatewayId = ((Number) gateway.get("id")).longValue();
         long applied = number(body.get("appliedRevision"), 0);
+        String checksum = text(body.get("configChecksum"), null);
         String status = text(body.get("status"), "FAILED").toUpperCase();
         if (!List.of("APPLIED", "FAILED", "RESTART_REQUIRED").contains(status)) {
             throw new BusinessException("不支持的应用状态");
         }
         jdbcTemplate.update("""
-                INSERT INTO dev_gateway_config_state(gateway_id,desired_revision,applied_revision,apply_status,last_error,last_sync_time)
-                VALUES (?,?,?, ?,?,NOW())
+                INSERT INTO dev_gateway_config_state(gateway_id,desired_revision,applied_revision,applied_checksum,apply_status,last_error,last_sync_time)
+                VALUES (?,?,?,?,?,?,NOW())
                 ON DUPLICATE KEY UPDATE applied_revision=VALUES(applied_revision),apply_status=VALUES(apply_status),
-                  last_error=VALUES(last_error),last_sync_time=NOW()
-                """, gatewayId, applied, applied, status, text(body.get("error"), null));
-        return Map.of("accepted", true, "appliedRevision", String.valueOf(applied), "status", status);
+                  applied_checksum=VALUES(applied_checksum),last_error=VALUES(last_error),last_sync_time=NOW()
+                """, gatewayId, applied, applied, checksum, status, text(body.get("error"), null));
+        recordResources(gatewayId, applied, checksum, body);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("accepted", true);
+        result.put("appliedRevision", String.valueOf(applied));
+        result.put("status", status);
+        if (checksum != null) result.put("configChecksum", checksum);
+        return result;
+    }
+
+    private void recordResources(long gatewayId, long revision, String checksum, Map<String, Object> body) {
+        Object resources = body.get("resources");
+        if (!(resources instanceof List<?> rows)) return;
+        for (Object item : rows) {
+            if (!(item instanceof Map<?, ?> row)) continue;
+            String type = text(row.get("resourceType"), text(row.get("type"), null));
+            String key = text(row.get("resourceKey"), text(row.get("key"), null));
+            if (type == null || key == null) continue;
+            String status = text(row.get("status"), "APPLIED").toUpperCase();
+            String message = text(row.get("message"), null);
+            jdbcTemplate.update("""
+                    INSERT INTO dev_gateway_config_resource
+                      (gateway_id, resource_type, resource_key, config_revision, config_checksum,
+                       apply_status, error_message, applied_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
+                    ON DUPLICATE KEY UPDATE config_revision=VALUES(config_revision),
+                      config_checksum=VALUES(config_checksum), apply_status=VALUES(apply_status),
+                      error_message=VALUES(error_message), applied_time=VALUES(applied_time)
+                    """, gatewayId, type, key, String.valueOf(revision), checksum, status, message);
+        }
     }
 
     public Map<String, Object> activeAlarms(String gatewaySn, String gatewaySecret) {
@@ -202,16 +233,66 @@ public class EdgeGatewaySyncService {
         return rows.get(0);
     }
 
-    private long desiredRevision(long gatewayId) {
-        Long value = jdbcTemplate.queryForObject("""
-                SELECT CAST(UNIX_TIMESTAMP(GREATEST(
-                  g.update_time,
-                  COALESCE((SELECT MAX(d.update_time) FROM dev_device d WHERE d.gateway_id=g.id),g.update_time),
-                  COALESCE((SELECT MAX(p.update_time) FROM dev_thing_model_point p JOIN dev_device d
-                    ON d.model_version_id=p.model_version_id WHERE d.gateway_id=g.id),g.update_time)
-                ))*1000 AS UNSIGNED) FROM dev_gateway g WHERE g.id=?
-                """, Long.class, gatewayId);
-        return value == null ? 0 : value;
+    private String configChecksum(Map<String, Object> gateway,
+                                  List<Map<String, Object>> devices,
+                                  List<Map<String, Object>> models) {
+        StringBuilder canonical = new StringBuilder();
+        canonical.append("gateway:")
+                .append(text(gateway.get("gateway_sn"), ""))
+                .append('\n');
+        for (Map<String, Object> device : devices) {
+            canonical.append("device:")
+                    .append(text(device.get("deviceSn"), ""))
+                    .append('|').append(text(device.get("channelId"), ""))
+                    .append('|').append(number(device.get("modbusAddr"), 0))
+                    .append('|').append(text(device.get("profileKey"), ""))
+                    .append('|').append(text(device.get("modelVersion"), ""))
+                    .append('|').append(number(device.get("collectIntervalS"), 0))
+                    .append('|').append(text(device.get("enabled"), ""))
+                    .append('\n');
+        }
+        for (Map<String, Object> model : models) {
+            canonical.append("model:")
+                    .append(text(model.get("profileKey"), ""))
+                    .append('|').append(text(model.get("version"), ""))
+                    .append('\n');
+            Object rawPoints = model.get("points");
+            if (rawPoints instanceof List<?> points) {
+                for (Object rawPoint : points) {
+                    if (!(rawPoint instanceof Map<?, ?> point)) continue;
+                    canonical.append("point:")
+                            .append(text(point.get("pointCode"), ""))
+                            .append('|').append(number(point.get("functionCode"), 0))
+                            .append('|').append(number(point.get("registerAddress"), 0))
+                            .append('|').append(number(point.get("registerLength"), 0))
+                            .append('|').append(text(point.get("valueType"), ""))
+                            .append('|').append(text(point.get("byteOrder"), ""))
+                            .append('|').append(text(point.get("scaleFactor"), ""))
+                            .append('|').append(text(point.get("offsetValue"), ""))
+                            .append('|').append(text(point.get("required"), ""))
+                            .append('\n');
+                }
+            }
+        }
+        return sha256Hex(canonical.toString());
+    }
+
+    private long revisionFromChecksum(String checksum) {
+        return Long.parseUnsignedLong(checksum.substring(0, 15), 16);
+    }
+
+    private String sha256Hex(String text) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(text.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(hash.length * 2);
+            for (byte value : hash) {
+                hex.append(String.format("%02x", value));
+            }
+            return hex.toString();
+        } catch (Exception ex) {
+            throw new BusinessException("配置指纹计算失败");
+        }
     }
 
     private long number(Object value, long fallback) {

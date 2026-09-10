@@ -279,7 +279,7 @@ public class BillingErpService {
         jdbc.update("""
                 UPDATE dev_device
                 SET settlement_enabled = 1, meter_role = 'MAIN', meter_factor = 1.000000,
-                    quality_gate_start_date = ?, quality_threshold_pct = 95.00,
+                    quality_gate_start_date = ?, quality_threshold_pct = 80.00,
                     collect_interval_seconds = COALESCE(collect_interval_seconds, 300),
                     update_by = 'admin', update_time = NOW()
                 WHERE id = ?

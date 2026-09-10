@@ -497,7 +497,7 @@ public class SimpleTableService {
     private void applyDefaultCollectionPolicy(TableDefinition definition, Map<String, Object> values) {
         if (!"devices".equals(definition.resource())) return;
         values.putIfAbsent("collect_interval_seconds", 300);
-        values.putIfAbsent("quality_threshold_pct", java.math.BigDecimal.valueOf(95));
+        values.putIfAbsent("quality_threshold_pct", java.math.BigDecimal.valueOf(80));
         values.putIfAbsent("quality_gate_start_date", LocalDate.now());
     }
 
