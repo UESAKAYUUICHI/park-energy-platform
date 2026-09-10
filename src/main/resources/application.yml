@@ -9,9 +9,9 @@ spring:
       max-file-size: 5MB
       max-request-size: 6MB
   datasource:
-    url: ${PARK_DB_URL:jdbc:mysql://localhost:3306/park_energy_system?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true}
-    username: ${PARK_DB_USERNAME:root}
-    password: ${PARK_DB_PASSWORD:}
+    url: ${PARK_DB_URL:jdbc:mysql://115.159.222.238:3306/park_energy_system?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true}
+    username: ${PARK_DB_USERNAME:admin}
+    password: ${PARK_DB_PASSWORD:Saki#Mygo06}
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       pool-name: ParkPlatformPool

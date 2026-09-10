@@ -118,6 +118,14 @@ public class EnergyProxyController {
                 request.getParameter("startTime"), request.getParameter("endTime")));
     }
 
+    @GetMapping("/collection-windows")
+    @SaCheckPermission("energy:view")
+    public ApiResponse<Object> collectionWindows(HttpServletRequest request) {
+        accessService.assertDeviceAccess(requiredLongParam(request, "deviceId"));
+        return ApiResponse.success(remoteServiceClient.getDataPayload(
+                "/api/data/collection-windows" + queryString(request)));
+    }
+
     @GetMapping("/ranking")
     @SaCheckPermission("energy:view")
     public ApiResponse<Object> ranking(HttpServletRequest request) {

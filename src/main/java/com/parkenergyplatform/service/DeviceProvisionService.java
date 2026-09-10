@@ -81,7 +81,7 @@ public class DeviceProvisionService {
         String qualityGateDate = normalizeDate(text(value(body, "qualityGateStartDate", "quality_gate_start_date")), "质量门禁日期");
         if (!StringUtils.hasText(qualityGateDate)) qualityGateDate = LocalDateTime.now().toLocalDate().toString();
         long collectInterval = longOrDefault(version.get("collect_interval_seconds"), 300);
-        BigDecimal qualityThreshold = decimal(version.get("quality_threshold_pct"), new BigDecimal("95"));
+        BigDecimal qualityThreshold = decimal(version.get("quality_threshold_pct"), new BigDecimal("80"));
         KeyHolder holder = new GeneratedKeyHolder();
         Long finalOrgId = orgId;
         String finalDeviceName = deviceName;

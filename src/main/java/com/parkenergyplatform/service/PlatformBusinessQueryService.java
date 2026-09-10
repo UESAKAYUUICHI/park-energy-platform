@@ -914,7 +914,7 @@ public class PlatformBusinessQueryService {
         if (quality == null) return "NO_DATA";
         if (numberOrZero(quality.get("abnormal_days")) > 0) return "ABNORMAL";
         BigDecimal rate = decimalOrDefault(quality, BigDecimal.ZERO, "avg_complete_rate");
-        return rate.compareTo(BigDecimal.valueOf(95)) >= 0 ? "NORMAL" : "RISK";
+        return rate.compareTo(BigDecimal.valueOf(80)) > 0 ? "NORMAL" : "RISK";
     }
 
     private List<Map<String, Object>> orgBreadcrumb(long orgId) {
