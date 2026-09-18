@@ -66,10 +66,4 @@ public class BusinessWorkspaceController {
         return ApiResponse.success(workspaceService.sendDeviceCommand(request));
     }
 
-    @PostMapping("/parse-test")
-    @SaCheckPermission("archive:edit")
-    @OperationLog(module = "档案管理", operation = "测点解析测试")
-    public ApiResponse<Map<String, Object>> parseTest(@RequestBody Map<String, Object> request) {
-        return ApiResponse.success(workspaceService.parseTest(request));
-    }
 }

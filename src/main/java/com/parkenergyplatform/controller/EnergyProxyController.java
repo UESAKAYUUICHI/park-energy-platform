@@ -8,6 +8,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.StringJoiner;
+import java.util.Collections;
 
 import cn.dev33.satoken.annotation.SaCheckPermission;
 import com.parkenergyplatform.common.ApiResponse;
@@ -102,7 +103,35 @@ public class EnergyProxyController {
     @SaCheckPermission("energy:view")
     public ApiResponse<Object> history(HttpServletRequest request) {
         accessService.assertDeviceAccess(requiredLongParam(request, "deviceId"));
-        return ApiResponse.success(remoteServiceClient.getDataPayload("/api/data/history" + queryString(request)));
+        return ApiResponse.success(remoteServiceClient.getDataPayload("/api/data/history",
+                remoteParams(request, false)));
+    }
+
+    /**
+     * Returns the real wide history rows written by the data service.
+     * One row represents one collection batch and contains all points from that batch.
+     */
+    @GetMapping("/history/page")
+    @SaCheckPermission("energy:view")
+    public ApiResponse<Map<String, Object>> historyPage(HttpServletRequest request) {
+        accessService.assertDeviceAccess(requiredLongParam(request, "deviceId"));
+        Object payload = remoteServiceClient.getDataPayload("/api/data/history",
+                remoteParams(request, true));
+        List<Map<String, Object>> rows = payload instanceof List<?> list
+                ? list.stream().filter(Map.class::isInstance)
+                    .map(row -> (Map<String, Object>) row).toList()
+                : Collections.emptyList();
+        int pageNum = positiveInt(request.getParameter("pageNum"), 1);
+        int pageSize = Math.min(positiveInt(request.getParameter("pageSize"), 20), 200);
+        int total = rows.size();
+        int from = Math.min((pageNum - 1) * pageSize, total);
+        int to = Math.min(from + pageSize, total);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("records", rows.subList(from, to));
+        result.put("total", total);
+        result.put("pageNum", pageNum);
+        result.put("pageSize", pageSize);
+        return ApiResponse.success(result);
     }
 
     @GetMapping("/history/series")
@@ -283,14 +312,43 @@ public class EnergyProxyController {
     }
 
     private String queryString(HttpServletRequest request) {
+        return queryString(request, false);
+    }
+
+    private String queryStringWithoutPaging(HttpServletRequest request) {
+        return queryString(request, true);
+    }
+
+    private Map<String, String> remoteParams(HttpServletRequest request, boolean withoutPaging) {
+        return request.getParameterMap().entrySet().stream()
+                .filter(entry -> !withoutPaging
+                        || (!"pageNum".equals(entry.getKey()) && !"pageSize".equals(entry.getKey())))
+                .filter(entry -> entry.getValue().length > 0 && entry.getValue()[0] != null)
+                .collect(java.util.stream.Collectors.toMap(
+                        Map.Entry::getKey,
+                        entry -> entry.getValue()[0],
+                        (left, right) -> left,
+                        LinkedHashMap::new));
+    }
+
+    private String queryString(HttpServletRequest request, boolean withoutPaging) {
         StringJoiner joiner = new StringJoiner("&");
         request.getParameterMap().forEach((key, values) -> {
-            if (values.length > 0) {
+            if (values.length > 0 && (!withoutPaging || (!"pageNum".equals(key) && !"pageSize".equals(key)))) {
                 joiner.add(encode(key) + "=" + encode(values[0]));
             }
         });
         String value = joiner.toString();
         return value.isBlank() ? "" : "?" + value;
+    }
+
+    private int positiveInt(String value, int fallback) {
+        try {
+            int parsed = Integer.parseInt(value == null ? "" : value);
+            return parsed > 0 ? parsed : fallback;
+        } catch (NumberFormatException ex) {
+            return fallback;
+        }
     }
 
     private String encode(String value) {

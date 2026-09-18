@@ -110,21 +110,6 @@ public class ArchiveController {
         return ApiResponse.success(queryService.deviceTypePoints(typeId));
     }
 
-    @PostMapping("/device-types/{typeId}/points/batch")
-    @SaCheckPermission("archive:edit")
-    @OperationLog(module = "档案管理", operation = "批量保存设备类型测点")
-    public ApiResponse<Map<String, Object>> saveDeviceTypePoints(@PathVariable long typeId,
-                                                                 @RequestBody Map<String, Object> body) {
-        return ApiResponse.success(queryService.saveDeviceTypePoints(typeId, body));
-    }
-
-    @PostMapping("/point-mappings/parse-test")
-    @SaCheckPermission("archive:edit")
-    @OperationLog(module = "档案管理", operation = "测点解析测试")
-    public ApiResponse<Map<String, Object>> parseTest(@RequestBody Map<String, Object> request) {
-        return ApiResponse.success(workspaceService.parseTest(request));
-    }
-
     @PostMapping("/gateways/{gatewayId}/bind-devices")
     @SaCheckPermission("archive:edit")
     @OperationLog(module = "档案管理", operation = "绑定网关设备")

@@ -146,6 +146,7 @@ public class PlatformBusinessQueryService {
         List<Map<String, Object>> devices = jdbcTemplate.queryForList("""
                 SELECT d.id, d.device_sn, d.device_name, d.gateway_id, d.org_id, d.space_id,
                        d.device_type_id, d.model_version_id, d.protocol_addr, d.settlement_enabled, d.status,
+                       d.online_status, d.last_online_time,
                        t.type_code, t.type_name
                 FROM dev_device d
                 LEFT JOIN dev_device_type t ON t.id = d.device_type_id
@@ -178,7 +179,8 @@ public class PlatformBusinessQueryService {
         pageArgs.add(pageSize);
         pageArgs.add((pageNum - 1) * pageSize);
         List<Map<String, Object>> rows = jdbcTemplate.queryForList("""
-                SELECT d.id, d.device_sn, d.device_name, d.status, d.gateway_id, d.org_id,
+                SELECT d.id, d.device_sn, d.device_name, d.status, d.online_status, d.last_online_time,
+                       d.gateway_id, d.org_id,
                        o.org_name, g.gateway_name, g.gateway_sn, t.type_name,
                        CONCAT_WS(' ', b.brand_name, m.model_name, v.version_name) AS model_display_name, m.image_object_key
                 FROM dev_device d
@@ -242,7 +244,7 @@ public class PlatformBusinessQueryService {
         Map<String, Object> rawRealtime = realtimeOrEmpty(deviceId);
         profile.put("realtimeRaw", rawRealtime);
         profile.put("realtime", normalizeRealtime(rawRealtime,
-                castRows(pointProfile.get("definitions")), castRows(pointProfile.get("mappings"))));
+                castRows(pointProfile.get("definitions")), castRows(pointProfile.get("bindings"))));
         profile.put("latestStats", jdbcTemplate.queryForList("""
                 SELECT *
                 FROM stats_daily_point
@@ -296,13 +298,20 @@ public class PlatformBusinessQueryService {
         }
         List<Map<String, Object>> energyTrend = energyTrend(trendParams);
         profile.put("energyTrend", energyTrend);
-        profile.put("summary", Map.of(
-                "pointCount", ((List<?>) points.getOrDefault("definitions", List.of())).size(),
-                "historyCount", recentHistory.size(),
-                "alarmCount", recentAlarms.size(),
-                "commandCount", inspectionRecords.size(),
-                "energyTrendCount", energyTrend.size()
-        ));
+        Map<String, Object> realtime = castMap(profile.get("realtime"));
+        long realtimePointCount = castRows(realtime.get("points")).stream()
+                .filter(point -> point.get("value") != null)
+                .count();
+        Map<String, Object> summary = new LinkedHashMap<>();
+        summary.put("pointCount", ((List<?>) points.getOrDefault("definitions", List.of())).size());
+        summary.put("historyCount", recentHistory.size());
+        summary.put("alarmCount", recentAlarms.size());
+        summary.put("commandCount", inspectionRecords.size());
+        summary.put("energyTrendCount", energyTrend.size());
+        summary.put("realtimeAvailable", realtime.getOrDefault("available", false));
+        summary.put("realtimePointCount", realtimePointCount);
+        summary.put("realtimeCollectTime", realtime.get("collectTime"));
+        profile.put("summary", summary);
         return profile;
     }
 
@@ -365,7 +374,7 @@ public class PlatformBusinessQueryService {
         Map<String, Object> profile = new LinkedHashMap<>();
         profile.put("gateway", gateway);
         profile.put("deviceCount", queryLong("SELECT COUNT(*) FROM dev_device WHERE gateway_id = ?", List.of(gatewayId)));
-        profile.put("onlineDeviceCount", queryLong("SELECT COUNT(*) FROM dev_device WHERE gateway_id = ? AND status = 1", List.of(gatewayId)));
+        profile.put("onlineDeviceCount", queryLong("SELECT COUNT(*) FROM dev_device WHERE gateway_id = ? AND status = 1 AND online_status = 1", List.of(gatewayId)));
         List<Map<String, Object>> recentAlarms = gatewayAlarms(gatewayId);
         List<Map<String, Object>> alarmTrend = gatewayAlarmTrend(gatewayId);
         List<Map<String, Object>> energyTrend = gatewayEnergyTrend(gatewayId);
@@ -395,14 +404,14 @@ public class PlatformBusinessQueryService {
                 ORDER BY sort, id
                 """, typeId);
         data.put("definitions", definitions);
-        if (deviceCatalogService.isDeviceTypeWritable(typeId)) {
-            ensureDefaultPointMappings(typeId, definitions);
-        }
-        data.put("mappings", jdbcTemplate.queryForList("""
-                SELECT *
-                FROM dev_point_mapping
-                WHERE device_type_id = ?
-                ORDER BY id
+        data.put("bindings", jdbcTemplate.queryForList("""
+                SELECT b.*,f.field_code,f.field_name,f.document_address,f.value_type,f.raw_unit,
+                       rb.function_code,rb.start_address,rb.register_count
+                FROM dev_device_model_version v
+                JOIN dev_model_point_binding b ON b.model_version_id=v.id
+                JOIN dev_protocol_field f ON f.id=b.protocol_field_id
+                JOIN dev_protocol_read_block rb ON rb.id=f.read_block_id
+                WHERE v.device_type_id=? ORDER BY b.sort,b.id
                 """, typeId));
         return data;
     }
@@ -480,125 +489,6 @@ public class PlatformBusinessQueryService {
                 ORDER BY s.stat_date
                 LIMIT 30
                 """, gatewayId);
-    }
-
-    @Transactional
-    @SuppressWarnings("unchecked")
-    public Map<String, Object> saveDeviceTypePoints(long typeId, Map<String, Object> request) {
-        if (singleOrNull("SELECT * FROM dev_device_type WHERE id = ?", typeId) == null) {
-            throw new BusinessException(404, "设备类型不存在: " + typeId);
-        }
-        deviceCatalogService.assertDeviceTypeWritable(typeId);
-        List<Map<String, Object>> definitions = request.get("definitions") instanceof List<?> list
-                ? list.stream().filter(Map.class::isInstance).map(item -> (Map<String, Object>) item).toList()
-                : List.of();
-        List<Map<String, Object>> mappings = request.get("mappings") instanceof List<?> list
-                ? list.stream().filter(Map.class::isInstance).map(item -> (Map<String, Object>) item).toList()
-                : List.of();
-        List<Map<String, Object>> mappingsToSave = normalizedPointMappings(definitions, mappings);
-        jdbcTemplate.update("DELETE FROM dev_point_mapping WHERE device_type_id = ?", typeId);
-        jdbcTemplate.update("DELETE FROM dev_point_definition WHERE device_type_id = ?", typeId);
-        for (Map<String, Object> definition : definitions) {
-            jdbcTemplate.update("""
-                    INSERT INTO dev_point_definition
-                      (device_type_id, point_code, point_name, data_type, unit, precision_scale,
-                       business_role, billable, stat_enabled, sort, enabled)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, typeId,
-                    text(definition, "pointCode", "point_code"),
-                    text(definition, "pointName", "point_name"),
-                    textOrDefault(definition, "dataType", "data_type", "DOUBLE"),
-                    text(definition, "unit"),
-                    integerOrDefault(definition, 2, "precisionScale", "precision_scale"),
-                    textOrDefault(definition, "businessRole", "business_role", "INSTANT_VALUE"),
-                    integerOrDefault(definition, 0, "billable"),
-                    integerOrDefault(definition, 1, "statEnabled", "stat_enabled"),
-                    integerOrDefault(definition, 0, "sort"),
-                    integerOrDefault(definition, 1, "enabled"));
-        }
-        for (Map<String, Object> mapping : mappingsToSave) insertPointMapping(typeId, mapping);
-        return deviceTypePoints(typeId);
-    }
-
-    private void ensureDefaultPointMappings(long typeId, List<Map<String, Object>> definitions) {
-        if (typeId <= 0 || definitions.isEmpty()) {
-            return;
-        }
-        List<Map<String, Object>> existingMappings = jdbcTemplate.queryForList(
-                "SELECT * FROM dev_point_mapping WHERE device_type_id = ?", typeId);
-        Set<String> existingCodes = new LinkedHashSet<>();
-        for (Map<String, Object> mapping : existingMappings) {
-            String pointCode = text(mapping, "pointCode", "point_code");
-            if (pointCode != null && !pointCode.isBlank()) {
-                existingCodes.add(pointCode);
-            }
-        }
-        for (Map<String, Object> mapping : normalizedPointMappings(definitions, existingMappings)) {
-            String pointCode = text(mapping, "pointCode", "point_code");
-            if (pointCode != null && !existingCodes.contains(pointCode)) {
-                insertPointMapping(typeId, mapping);
-            }
-        }
-    }
-
-    private void insertPointMapping(long typeId, Map<String, Object> mapping) {
-        jdbcTemplate.update("""
-                INSERT INTO dev_point_mapping
-                  (device_type_id, point_code, protocol_type, source_path, function_code, register_address,
-                   register_length, value_type, byte_order, scale_factor, offset_value, expression, required)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, typeId,
-                text(mapping, "pointCode", "point_code"),
-                textOrDefault(mapping, "protocolType", "protocol_type", "JSON"),
-                text(mapping, "sourcePath", "source_path"),
-                text(mapping, "functionCode", "function_code"),
-                integerOrNull(mapping, "registerAddress", "register_address"),
-                integerOrNull(mapping, "registerLength", "register_length"),
-                textOrDefault(mapping, "valueType", "value_type", "DOUBLE"),
-                text(mapping, "byteOrder", "byte_order"),
-                decimalOrDefault(mapping, BigDecimal.ONE, "scaleFactor", "scale_factor"),
-                decimalOrDefault(mapping, BigDecimal.ZERO, "offsetValue", "offset_value"),
-                text(mapping, "expression"),
-                integerOrDefault(mapping, 0, "required"));
-    }
-
-    private List<Map<String, Object>> normalizedPointMappings(List<Map<String, Object>> definitions,
-                                                              List<Map<String, Object>> mappings) {
-        Set<String> definitionCodes = new LinkedHashSet<>();
-        Map<String, String> valueTypes = new LinkedHashMap<>();
-        for (Map<String, Object> definition : definitions) {
-            String pointCode = text(definition, "pointCode", "point_code");
-            if (pointCode == null || pointCode.isBlank()) {
-                continue;
-            }
-            definitionCodes.add(pointCode);
-            valueTypes.put(pointCode, textOrDefault(definition, "dataType", "data_type", "DOUBLE"));
-        }
-
-        Map<String, Map<String, Object>> byPointCode = new LinkedHashMap<>();
-        for (Map<String, Object> mapping : mappings) {
-            String pointCode = text(mapping, "pointCode", "point_code");
-            if (pointCode == null || pointCode.isBlank() || !definitionCodes.contains(pointCode)) {
-                continue;
-            }
-            byPointCode.put(pointCode, mapping);
-        }
-
-        for (String pointCode : definitionCodes) {
-            if (byPointCode.containsKey(pointCode)) {
-                continue;
-            }
-            Map<String, Object> mapping = new LinkedHashMap<>();
-            mapping.put("point_code", pointCode);
-            mapping.put("protocol_type", "JSON");
-            mapping.put("source_path", "$." + pointCode);
-            mapping.put("value_type", valueTypes.getOrDefault(pointCode, "DOUBLE"));
-            mapping.put("scale_factor", BigDecimal.ONE);
-            mapping.put("offset_value", BigDecimal.ZERO);
-            mapping.put("required", 0);
-            byPointCode.put(pointCode, mapping);
-        }
-        return new ArrayList<>(byPointCode.values());
     }
 
     public Map<String, Object> realtimeBatch(List<Long> deviceIds) {
@@ -1321,6 +1211,7 @@ public class PlatformBusinessQueryService {
     public List<Map<String, Object>> commandTypes() {
         return List.of(
                 Map.of("commandType", "READ_NOW", "targetType", "DEVICE", "label", "立即读取"),
+                Map.of("commandType", "DEVICE_COMMAND", "targetType", "DEVICE", "label", "执行设备协议命令"),
                 Map.of("commandType", "SET_INTERVAL", "targetType", "GATEWAY", "label", "设置上报间隔"),
                 Map.of("commandType", "REBOOT_GATEWAY", "targetType", "GATEWAY", "label", "重启网关")
         );

@@ -300,7 +300,7 @@ public class SimpleTableService {
             if (id != null) deviceCatalogService.assertDeviceTypeWritable(id);
             return;
         }
-        if (!Set.of("point-definitions", "point-mappings").contains(resource)) return;
+        if (!"point-definitions".equals(resource)) return;
         Long deviceTypeId = longOrNull(values.get("device_type_id"));
         if (deviceTypeId != null) deviceCatalogService.assertDeviceTypeWritable(deviceTypeId);
     }
