@@ -60,4 +60,5 @@ public class DeviceProvisionController {
     public ApiResponse<Map<String, Object>> unbind(@PathVariable long deviceId, @RequestBody Map<String, Object> body) {
         return ApiResponse.success(provisionService.unbind(deviceId, body));
     }
+
 }

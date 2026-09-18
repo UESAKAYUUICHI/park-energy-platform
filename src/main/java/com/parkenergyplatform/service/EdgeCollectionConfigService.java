@@ -21,12 +21,15 @@ public class EdgeCollectionConfigService {
     private final JdbcTemplate jdbcTemplate;
     private final BusinessDataAccessService accessService;
     private final RemoteServiceClient remoteServiceClient;
+    private final EdgeGatewaySyncService gatewaySyncService;
 
     public EdgeCollectionConfigService(JdbcTemplate jdbcTemplate, BusinessDataAccessService accessService,
-                                       RemoteServiceClient remoteServiceClient) {
+                                       RemoteServiceClient remoteServiceClient,
+                                       EdgeGatewaySyncService gatewaySyncService) {
         this.jdbcTemplate = jdbcTemplate;
         this.accessService = accessService;
         this.remoteServiceClient = remoteServiceClient;
+        this.gatewaySyncService = gatewaySyncService;
     }
 
     public Map<String, Object> overview(Map<String, String> params) {
@@ -57,6 +60,15 @@ public class EdgeCollectionConfigService {
                          s.apply_status,s.last_error,s.last_sync_time
                 ORDER BY g.id
                 """, args.toArray());
+        for (Map<String, Object> gateway : gateways) {
+            long gatewayId = number(gateway.get("gatewayId"), 0);
+            if (gatewayId <= 0) continue;
+            Map<String, Object> check = precheck(gatewayId);
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> checkIssues = (List<Map<String, Object>>) check.getOrDefault("issues", List.of());
+            gateway.put("precheckPassed", check.get("passed"));
+            gateway.put("precheckIssueCount", checkIssues.size());
+        }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("gateways", gateways);
         result.put("summary", summarize(gateways));
@@ -82,9 +94,11 @@ public class EdgeCollectionConfigService {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("gateway", gateway);
         result.put("devices", devices);
-        result.put("channels", channels(devices));
+        result.put("channels", channels(gatewayId, devices));
         result.put("models", models);
         result.put("resources", resources(gatewayId));
+        result.put("ports", ports(gatewayId));
+        result.put("releases", releases(gatewayId));
         result.put("audit", audit(gatewayId));
         result.put("precheck", precheck(gatewayId));
         return result;
@@ -96,18 +110,53 @@ public class EdgeCollectionConfigService {
         List<Map<String, Object>> points = jdbcTemplate.queryForList("""
                 SELECT d.device_sn AS deviceSn, d.edge_channel_id AS channelId,
                        CAST(d.protocol_addr AS UNSIGNED) AS modbusAddr,
-                       m.model_code AS profileKey, p.point_code AS pointCode,
-                       p.function_code AS functionCode, p.register_address AS registerAddress,
-                       p.register_length AS registerLength, p.value_type AS valueType,
-                       p.byte_order AS byteOrder
+                       pp.profile_code AS profileKey, b.id AS modelPointId, b.point_code AS pointCode,
+                       b.point_code AS standardPointCode,
+                       pd.id AS standardDefinitionId,
+                       rb.function_code AS functionCode, rb.start_address+f.register_offset AS registerAddress,
+                       f.register_length AS registerLength, f.value_type AS valueType,
+                       f.byte_order AS byteOrder,f.bit_offset AS bitOffset,f.bit_length AS bitLength
                 FROM dev_device d
                 LEFT JOIN dev_device_model_version v ON v.id=d.model_version_id
                 LEFT JOIN dev_device_model m ON m.id=v.model_id
-                LEFT JOIN dev_thing_model_point p ON p.model_version_id=d.model_version_id AND p.enabled=1
+                LEFT JOIN dev_protocol_profile_version pv ON pv.id=v.protocol_profile_version_id
+                LEFT JOIN dev_protocol_profile pp ON pp.id=pv.profile_id
+                LEFT JOIN dev_model_point_binding b ON b.model_version_id=v.id
+                LEFT JOIN dev_protocol_field f ON f.id=b.protocol_field_id
+                LEFT JOIN dev_protocol_read_block rb ON rb.id=f.read_block_id
+                LEFT JOIN dev_point_definition pd ON pd.device_type_id=v.device_type_id
+                  AND BINARY pd.point_code=BINARY b.point_code AND pd.enabled=1
                 WHERE d.gateway_id=?
-                ORDER BY d.id,p.sort,p.id
+                ORDER BY d.id,b.sort,b.id
                 """, gatewayId);
         List<Map<String, Object>> issues = new ArrayList<>();
+        List<Map<String, Object>> channelRows = jdbcTemplate.queryForList("""
+                SELECT channel_id AS channelId,protocol,serial_port AS serialPort,baud_rate AS baudRate,
+                       data_bits AS dataBits,stop_bits AS stopBits,parity,timeout_ms AS timeoutMs,
+                       retry_count AS retryCount,enabled
+                FROM dev_gateway_channel WHERE gateway_id=? ORDER BY channel_id
+                """, gatewayId);
+        Map<String, String> portOwner = new LinkedHashMap<>();
+        for (Map<String, Object> channel : channelRows) {
+            String channelId = text(channel.get("channelId"));
+            String protocol = text(channel.get("protocol")).toUpperCase(Locale.ROOT);
+            String serialPort = text(channel.get("serialPort"));
+            if (!"MODBUS_RTU".equals(protocol)) {
+                issues.add(issue("ERROR", channelId, "当前网关运行时只支持 Modbus RTU 主站"));
+            }
+            if (serialPort.isBlank()) {
+                issues.add(issue("ERROR", channelId, "通道未选择网关串口"));
+            }
+            if (number(channel.get("enabled"), 0) == 1 && !serialPort.isBlank()) {
+                String previous = portOwner.putIfAbsent(serialPort.toLowerCase(Locale.ROOT), channelId);
+                if (previous != null) {
+                    issues.add(issue("ERROR", channelId, "同一串口已被启用通道占用：" + previous));
+                }
+            }
+        }
+        if (channelRows.isEmpty()) {
+            issues.add(issue("ERROR", "GATEWAY", "网关至少需要一个采集通道"));
+        }
         Map<String, String> addressOwner = new LinkedHashMap<>();
         for (Map<String, Object> device : devices) {
             String sn = text(device.get("deviceSn"));
@@ -134,6 +183,10 @@ public class EdgeCollectionConfigService {
             String pointCode = text(point.get("pointCode"));
             if (pointCode.isBlank()) continue;
             String owner = text(point.get("deviceSn")) + "/" + pointCode;
+            String standardPointCode = text(point.get("standardPointCode"));
+            if (standardPointCode.isBlank() || point.get("standardDefinitionId") == null) {
+                issues.add(issue("ERROR", owner, "标准测点 " + standardPointCode + " 未在当前设备类型中定义"));
+            }
             int functionCode = number(point.get("functionCode"), 0);
             int length = number(point.get("registerLength"), 0);
             int address = number(point.get("registerAddress"), -1);
@@ -146,8 +199,8 @@ public class EdgeCollectionConfigService {
                 issues.add(issue("ERROR", owner, "寄存器地址越界"));
             }
             int expectedLength = switch (valueType) {
-                case "u16", "i16" -> 1;
-                case "u32", "i32", "f32", "float32" -> 2;
+                case "u16", "uint16", "i16", "int16", "boolean" -> 1;
+                case "u32", "uint32", "i32", "int32", "f32", "float32" -> 2;
                 default -> -1;
             };
             if (expectedLength < 0) {
@@ -163,8 +216,98 @@ public class EdgeCollectionConfigService {
         result.put("passed", issues.stream().noneMatch(item -> "ERROR".equals(item.get("level"))));
         result.put("issues", issues);
         result.put("deviceCount", devices.size());
-        result.put("pointCount", points.stream().filter(row -> !text(row.get("pointCode")).isBlank()).count());
+        result.put("pointCount", points.stream()
+                .filter(row -> row.get("modelPointId") != null)
+                .map(row -> row.get("modelPointId"))
+                .distinct().count());
         return result;
+    }
+
+    public Map<String, Object> deviceCandidates(long gatewayId, Map<String, String> params) {
+        accessService.assertGatewayAccess(gatewayId);
+        Map<String, Object> gateway = single("SELECT org_id AS orgId FROM dev_gateway WHERE id=?", gatewayId);
+        Long orgId = longOrNull(params.get("orgId"));
+        if (orgId == null) orgId = longOrNull(gateway.get("orgId"));
+        String keyword = "%" + text(params.get("keyword")) + "%";
+        List<Object> args = new ArrayList<>();
+        String scope = accessService.orgFilterSql("d.org_id", orgId, true, args);
+        args.add(gatewayId);
+        args.add(keyword);
+        args.add(keyword);
+        args.add(keyword);
+        args.add(gatewayId);
+        List<Map<String, Object>> devices = jdbcTemplate.queryForList("""
+                SELECT d.id AS deviceId,d.device_sn AS deviceSn,d.device_name AS deviceName,
+                       d.gateway_id AS gatewayId,g.gateway_name AS gatewayName,g.gateway_sn AS gatewaySn,
+                       d.edge_channel_id AS channelId,CAST(d.protocol_addr AS UNSIGNED) AS modbusAddr,
+                       d.collect_interval_seconds AS collectIntervalSeconds,d.status,
+                       v.id AS modelVersionId,v.version_name AS modelVersion,
+                       m.model_code AS profileKey,m.model_name AS modelName,
+                       o.org_name AS orgName
+                FROM dev_device d
+                LEFT JOIN dev_gateway g ON g.id=d.gateway_id
+                LEFT JOIN dev_org o ON o.id=d.org_id
+                LEFT JOIN dev_device_model_version v ON v.id=d.model_version_id
+                LEFT JOIN dev_device_model m ON m.id=v.model_id
+                WHERE 1=1
+                """ + scope + """
+                  AND (d.gateway_id IS NULL OR d.gateway_id=?)
+                  AND (?='%%' OR d.device_sn LIKE ? OR d.device_name LIKE ?)
+                ORDER BY CASE WHEN d.gateway_id=? THEN 0 ELSE 1 END,d.device_sn
+                LIMIT 500
+                """, args.toArray());
+        return Map.of("gatewayId", gatewayId, "devices", devices);
+    }
+
+    @Transactional
+    public Map<String, Object> createChannel(long gatewayId, Map<String, Object> body) {
+        accessService.assertGatewayAccess(gatewayId);
+        Map<String, Object> channel = normalizeChannel(body, null);
+        jdbcTemplate.update("""
+                INSERT INTO dev_gateway_channel
+                  (gateway_id,channel_id,channel_name,protocol,serial_port,baud_rate,data_bits,
+                   stop_bits,parity,timeout_ms,retry_count,poll_interval_seconds,enabled,remark,
+                   create_by,update_by)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, gatewayId, channel.get("channelId"), channel.get("channelName"), channel.get("protocol"),
+                channel.get("serialPort"), channel.get("baudRate"), channel.get("dataBits"), channel.get("stopBits"),
+                channel.get("parity"), channel.get("timeoutMs"), channel.get("retryCount"),
+                channel.get("pollIntervalSeconds"), channel.get("enabled"), channel.get("remark"),
+                operator(), operator());
+        touchDraft(gatewayId, "CHANNEL_CREATE", 0L, null, channel);
+        return gatewayDetail(gatewayId);
+    }
+
+    @Transactional
+    public Map<String, Object> updateChannel(long gatewayId, String channelId, Map<String, Object> body) {
+        accessService.assertGatewayAccess(gatewayId);
+        Map<String, Object> before = single("SELECT * FROM dev_gateway_channel WHERE gateway_id=? AND channel_id=?", gatewayId, channelId);
+        Map<String, Object> channel = normalizeChannel(body, channelId);
+        jdbcTemplate.update("""
+                UPDATE dev_gateway_channel
+                SET channel_name=?,protocol=?,serial_port=?,baud_rate=?,data_bits=?,stop_bits=?,
+                    parity=?,timeout_ms=?,retry_count=?,poll_interval_seconds=?,enabled=?,remark=?,
+                    update_by=?,update_time=NOW()
+                WHERE gateway_id=? AND channel_id=?
+                """, channel.get("channelName"), channel.get("protocol"), channel.get("serialPort"),
+                channel.get("baudRate"), channel.get("dataBits"), channel.get("stopBits"), channel.get("parity"),
+                channel.get("timeoutMs"), channel.get("retryCount"), channel.get("pollIntervalSeconds"),
+                channel.get("enabled"), channel.get("remark"), operator(), gatewayId, channelId);
+        touchDraft(gatewayId, "CHANNEL_UPDATE", 0L, before, channel);
+        return gatewayDetail(gatewayId);
+    }
+
+    @Transactional
+    public Map<String, Object> deleteChannel(long gatewayId, String channelId) {
+        accessService.assertGatewayAccess(gatewayId);
+        Long used = jdbcTemplate.queryForObject("""
+                SELECT COUNT(*) FROM dev_device WHERE gateway_id=? AND edge_channel_id=?
+                """, Long.class, gatewayId, channelId);
+        if (used != null && used > 0) throw new BusinessException("通道已绑定设备，不能删除");
+        Map<String, Object> before = single("SELECT * FROM dev_gateway_channel WHERE gateway_id=? AND channel_id=?", gatewayId, channelId);
+        jdbcTemplate.update("DELETE FROM dev_gateway_channel WHERE gateway_id=? AND channel_id=?", gatewayId, channelId);
+        touchDraft(gatewayId, "CHANNEL_DELETE", 0L, before, null);
+        return gatewayDetail(gatewayId);
     }
 
     @Transactional
@@ -174,10 +317,19 @@ public class EdgeCollectionConfigService {
                        d.protocol_addr AS protocolAddr,d.collect_interval_seconds AS collectIntervalSeconds
                 FROM dev_device d WHERE d.id=?
                 """, deviceId);
-        long gatewayId = ((Number) current.get("gatewayId")).longValue();
+        accessService.assertDeviceAccess(deviceId);
+        long gatewayId = number(value(body, "gatewayId", "gateway_id"), 0);
+        if (gatewayId <= 0 && current.get("gatewayId") != null) {
+            gatewayId = ((Number) current.get("gatewayId")).longValue();
+        }
+        if (gatewayId <= 0) throw new BusinessException("绑定设备时必须选择网关");
         accessService.assertGatewayAccess(gatewayId);
         String channelId = text(value(body, "channelId", "edgeChannelId", "edge_channel_id"));
         if (channelId.isBlank()) throw new BusinessException("RS485 通道不能为空");
+        Long channelExists = jdbcTemplate.queryForObject("""
+                SELECT COUNT(*) FROM dev_gateway_channel WHERE gateway_id=? AND channel_id=? AND enabled=1
+                """, Long.class, gatewayId, channelId);
+        if (channelExists == null || channelExists == 0) throw new BusinessException("请选择已启用的网关通道");
         int modbusAddr = number(value(body, "modbusAddr", "protocolAddr", "protocol_addr"), 0);
         if (modbusAddr < 1 || modbusAddr > 247) throw new BusinessException("Modbus 从站地址必须在 1-247");
         int interval = number(value(body, "collectIntervalSeconds", "collect_interval_seconds"), 300);
@@ -192,9 +344,13 @@ public class EdgeCollectionConfigService {
         }
         jdbcTemplate.update("""
                 UPDATE dev_device
-                SET edge_channel_id=?, protocol_addr=?, collect_interval_seconds=?, update_by=?, update_time=NOW()
+                SET gateway_id=?, edge_channel_id=?, protocol_addr=?, collect_interval_seconds=?, update_by=?, update_time=NOW()
                 WHERE id=?
-                """, channelId, String.valueOf(modbusAddr), interval, operator(), deviceId);
+                """, gatewayId, channelId, String.valueOf(modbusAddr), interval, operator(), deviceId);
+        Long sourceGatewayId = current.get("gatewayId") instanceof Number n ? n.longValue() : null;
+        if (sourceGatewayId != null && sourceGatewayId != gatewayId) {
+            touchDraft(sourceGatewayId, "DEVICE_MOVED_OUT", deviceId, current, Map.of("targetGatewayId", gatewayId));
+        }
         touchDraft(gatewayId, "DEVICE_BINDING", deviceId, current, Map.of(
                 "channelId", channelId, "modbusAddr", modbusAddr, "collectIntervalSeconds", interval));
         return gatewayDetail(gatewayId);
@@ -244,89 +400,18 @@ public class EdgeCollectionConfigService {
     }
 
     @Transactional
-    @SuppressWarnings("unchecked")
-    public Map<String, Object> replaceModelPoints(long modelVersionId, Map<String, Object> body) {
-        Map<String, Object> version = single("""
-                SELECT v.id AS modelVersionId,m.model_code AS profileKey,m.model_name AS modelName
-                FROM dev_device_model_version v JOIN dev_device_model m ON m.id=v.model_id
-                WHERE v.id=?
-                """, modelVersionId);
-        List<Long> gatewayIds = jdbcTemplate.queryForList("""
-                SELECT DISTINCT gateway_id FROM dev_device WHERE model_version_id=? AND gateway_id IS NOT NULL
-                """, Long.class, modelVersionId);
-        for (Long gatewayId : gatewayIds) accessService.assertGatewayAccess(gatewayId);
-        Object raw = body.get("points");
-        if (!(raw instanceof List<?> rows)) throw new BusinessException("点表不能为空");
-        List<Map<String, Object>> points = new ArrayList<>();
-        int sort = 10;
-        for (Object item : rows) {
-            if (!(item instanceof Map<?, ?> map)) continue;
-            Map<String, Object> point = new LinkedHashMap<>();
-            point.put("pointCode", text(value(map, "pointCode", "point_code")).toLowerCase(Locale.ROOT));
-            point.put("standardPointCode", text(value(map, "standardPointCode", "standard_point_code")).toUpperCase(Locale.ROOT));
-            point.put("pointName", text(value(map, "pointName", "point_name")));
-            point.put("unit", text(map.get("unit")));
-            point.put("functionCode", number(value(map, "functionCode", "function_code"), 0));
-            point.put("registerAddress", number(value(map, "registerAddress", "register_address", "address"), -1));
-            point.put("registerLength", number(value(map, "registerLength", "register_length", "quantity"), 0));
-            point.put("valueType", text(value(map, "valueType", "value_type", "dataType")).toLowerCase(Locale.ROOT));
-            point.put("byteOrder", text(value(map, "byteOrder", "byte_order")).toUpperCase(Locale.ROOT));
-            point.put("scaleFactor", decimal(value(map, "scaleFactor", "scale_factor", "scale"), BigDecimal.ONE));
-            point.put("offsetValue", decimal(value(map, "offsetValue", "offset_value", "offset"), BigDecimal.ZERO));
-            point.put("required", boolInt(value(map, "required"), true));
-            point.put("enabled", boolInt(value(map, "enabled"), true));
-            point.put("sort", number(value(map, "sort"), sort));
-            validatePoint(point);
-            points.add(point);
-            sort += 10;
-        }
-        if (points.isEmpty()) throw new BusinessException("至少需要一个采集点");
-        Map<String, String> seen = new LinkedHashMap<>();
-        for (Map<String, Object> point : points) {
-            String code = text(point.get("pointCode"));
-            String existing = seen.putIfAbsent(code, code);
-            if (existing != null) throw new BusinessException("点位编码重复：" + code);
-        }
-        List<Map<String, Object>> before = jdbcTemplate.queryForList(
-                "SELECT * FROM dev_thing_model_point WHERE model_version_id=? ORDER BY sort,id", modelVersionId);
-        jdbcTemplate.update("DELETE FROM dev_thing_model_point WHERE model_version_id=?", modelVersionId);
-        for (Map<String, Object> point : points) {
-            jdbcTemplate.update("""
-                    INSERT INTO dev_thing_model_point
-                      (model_version_id,point_code,standard_point_code,point_name,unit,function_code,
-                       register_address,register_length,value_type,byte_order,scale_factor,offset_value,required,enabled,sort)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, modelVersionId, point.get("pointCode"), point.get("standardPointCode"),
-                    point.get("pointName"), point.get("unit"), point.get("functionCode"),
-                    point.get("registerAddress"), point.get("registerLength"), point.get("valueType"),
-                    point.get("byteOrder"), point.get("scaleFactor"), point.get("offsetValue"),
-                    point.get("required"), point.get("enabled"), point.get("sort"));
-        }
-        for (Long gatewayId : gatewayIds) {
-            touchDraft(gatewayId, "MODEL_POINTS", modelVersionId, Map.of("model", version, "points", before),
-                    Map.of("model", version, "points", points));
-        }
-        return Map.of("modelVersionId", modelVersionId, "pointCount", points.size(),
-                "affectedGatewayCount", gatewayIds.size());
-    }
-
-    @Transactional
     public Map<String, Object> markPending(long gatewayId) {
         accessService.assertGatewayAccess(gatewayId);
         Map<String, Object> check = precheck(gatewayId);
         if (!Boolean.TRUE.equals(check.get("passed"))) {
             throw new BusinessException("发布前检查未通过");
         }
-        String checksum = checksum(gatewayId);
-        long revision = Long.parseUnsignedLong(checksum.substring(0, 15), 16);
-        jdbcTemplate.update("""
-                INSERT INTO dev_gateway_config_state(gateway_id,desired_revision,desired_checksum,apply_status,last_sync_time)
-                VALUES (?,?,?,'PENDING',NOW())
-                ON DUPLICATE KEY UPDATE desired_revision=VALUES(desired_revision),
-                  desired_checksum=VALUES(desired_checksum),apply_status='PENDING',last_sync_time=NOW()
-                """, gatewayId, revision, checksum);
-        audit(gatewayId, "PUBLISH", gatewayId, null, Map.of("desiredRevision", revision, "desiredChecksum", checksum));
-        return Map.of("gatewayId", gatewayId, "desiredRevision", String.valueOf(revision),
+        Map<String, Object> snapshot = gatewaySyncService.publishSnapshot(gatewayId, operator());
+        String revision = text(snapshot.get("desiredRevision"));
+        String checksum = text(snapshot.get("configChecksum"));
+        audit(gatewayId, "PUBLISH", gatewayId, null,
+                Map.of("desiredRevision", revision, "desiredChecksum", checksum));
+        return Map.of("gatewayId", gatewayId, "desiredRevision", revision,
                 "desiredChecksum", checksum, "applyStatus", "PENDING");
     }
 
@@ -336,44 +421,55 @@ public class EdgeCollectionConfigService {
                        d.edge_channel_id AS channelId, CAST(d.protocol_addr AS UNSIGNED) AS modbusAddr,
                        d.collect_interval_seconds AS collectIntervalSeconds, d.status AS status,
                        v.id AS modelVersionId, v.version_name AS modelVersion,
-                       m.model_code AS profileKey, m.model_name AS modelName,
-                       COUNT(p.id) AS pointCount
+                       pp.profile_code AS profileKey, m.model_name AS modelName,
+                       COUNT(b.id) AS pointCount
                 FROM dev_device d
                 LEFT JOIN dev_device_model_version v ON v.id=d.model_version_id
                 LEFT JOIN dev_device_model m ON m.id=v.model_id
-                LEFT JOIN dev_thing_model_point p ON p.model_version_id=d.model_version_id AND p.enabled=1
+                LEFT JOIN dev_protocol_profile_version pv ON pv.id=v.protocol_profile_version_id
+                LEFT JOIN dev_protocol_profile pp ON pp.id=pv.profile_id
+                LEFT JOIN dev_model_point_binding b ON b.model_version_id=v.id
                 WHERE d.gateway_id=?
                 GROUP BY d.id,d.device_sn,d.device_name,d.edge_channel_id,d.protocol_addr,
-                         d.collect_interval_seconds,d.status,v.id,v.version_name,m.model_code,m.model_name
+                         d.collect_interval_seconds,d.status,v.id,v.version_name,pp.profile_code,m.model_name
                 ORDER BY d.edge_channel_id,CAST(d.protocol_addr AS UNSIGNED),d.id
                 """, gatewayId);
     }
 
     private List<Map<String, Object>> models(long gatewayId) {
         List<Map<String, Object>> rows = jdbcTemplate.queryForList("""
-                SELECT DISTINCT v.id AS modelVersionId, m.model_code AS profileKey, m.model_name AS modelName,
-                       v.version_name AS modelVersion,
-                       COUNT(p.id) AS pointCount,
-                       MIN(p.register_address) AS minRegisterAddress,
-                       MAX(p.register_address + p.register_length - 1) AS maxRegisterAddress
+                SELECT DISTINCT v.id AS modelVersionId, pp.profile_code AS profileKey, m.model_name AS modelName,
+                       v.version_name AS modelVersion,pv.version_name AS protocolVersion,
+                       COUNT(DISTINCT b.id) AS pointCount,
+                       MIN(rb.start_address) AS minRegisterAddress,
+                       MAX(rb.start_address + rb.register_count - 1) AS maxRegisterAddress
                 FROM dev_device d
                 JOIN dev_device_model_version v ON v.id=d.model_version_id
                 JOIN dev_device_model m ON m.id=v.model_id
-                LEFT JOIN dev_thing_model_point p ON p.model_version_id=v.id AND p.enabled=1
+                LEFT JOIN dev_protocol_profile_version pv ON pv.id=v.protocol_profile_version_id
+                LEFT JOIN dev_protocol_profile pp ON pp.id=pv.profile_id
+                LEFT JOIN dev_model_point_binding b ON b.model_version_id=v.id
+                LEFT JOIN dev_protocol_field f ON f.id=b.protocol_field_id
+                LEFT JOIN dev_protocol_read_block rb ON rb.id=f.read_block_id
                 WHERE d.gateway_id=?
-                GROUP BY v.id,m.model_code,m.model_name,v.version_name
+                GROUP BY v.id,pp.profile_code,m.model_name,v.version_name,pv.version_name
                 ORDER BY v.id
                 """, gatewayId);
         for (Map<String, Object> row : rows) {
             row.put("points", jdbcTemplate.queryForList("""
-                    SELECT id, point_code AS pointCode, standard_point_code AS standardPointCode,
-                           point_name AS pointName, unit, function_code AS functionCode,
-                           register_address AS registerAddress, register_length AS registerLength,
-                           value_type AS valueType, byte_order AS byteOrder, scale_factor AS scaleFactor,
-                           offset_value AS offsetValue, required, enabled, sort
-                    FROM dev_thing_model_point
-                    WHERE model_version_id=?
-                    ORDER BY sort,id
+                    SELECT b.id,b.point_code AS pointCode,p.point_name AS pointName,p.unit,
+                           pf.field_code AS fieldCode,pf.field_name AS fieldName,pf.document_address AS documentAddress,
+                           rb.function_code AS functionCode,rb.start_address+pf.register_offset AS registerAddress,
+                           pf.register_length AS registerLength,pf.value_type AS valueType,pf.byte_order AS byteOrder,
+                           pf.bit_offset AS bitOffset,pf.bit_length AS bitLength,pf.decode_factor AS decodeFactor,
+                           b.canonical_factor AS canonicalFactor,b.display_factor AS displayFactor,b.display_unit AS displayUnit,
+                           b.required,b.sort
+                    FROM dev_model_point_binding b
+                    JOIN dev_point_definition p ON p.device_type_id=(SELECT device_type_id FROM dev_device_model_version WHERE id=b.model_version_id)
+                      AND BINARY p.point_code=BINARY b.point_code
+                    JOIN dev_protocol_field pf ON pf.id=b.protocol_field_id
+                    JOIN dev_protocol_read_block rb ON rb.id=pf.read_block_id
+                    WHERE b.model_version_id=? ORDER BY b.sort,b.id
                     """, row.get("modelVersionId")));
         }
         return rows;
@@ -391,6 +487,24 @@ public class EdgeCollectionConfigService {
                 """, gatewayId);
     }
 
+    private List<Map<String, Object>> ports(long gatewayId) {
+        return jdbcTemplate.queryForList("""
+                SELECT port_key AS portKey,system_path AS systemPath,port_type AS portType,
+                       available,last_seen_time AS lastSeenTime
+                FROM dev_gateway_port_inventory
+                WHERE gateway_id=? ORDER BY available DESC,port_key
+                """, gatewayId);
+    }
+
+    private List<Map<String, Object>> releases(long gatewayId) {
+        return jdbcTemplate.queryForList("""
+                SELECT id,revision,checksum,release_status AS releaseStatus,error_message AS errorMessage,
+                       published_by AS publishedBy,publish_time AS publishTime,applied_time AS appliedTime
+                FROM dev_gateway_config_release
+                WHERE gateway_id=? ORDER BY id DESC LIMIT 30
+                """, gatewayId);
+    }
+
     private List<Map<String, Object>> audit(long gatewayId) {
         return jdbcTemplate.queryForList("""
                 SELECT action_type AS actionType, target_type AS targetType, target_id AS targetId,
@@ -402,8 +516,22 @@ public class EdgeCollectionConfigService {
                 """, gatewayId);
     }
 
-    private List<Map<String, Object>> channels(List<Map<String, Object>> devices) {
+    private List<Map<String, Object>> channels(long gatewayId, List<Map<String, Object>> devices) {
         Map<String, Map<String, Object>> channels = new LinkedHashMap<>();
+        for (Map<String, Object> row : jdbcTemplate.queryForList("""
+                SELECT id,channel_id AS channelId,channel_name AS channelName,protocol,serial_port AS serialPort,
+                       baud_rate AS baudRate,data_bits AS dataBits,stop_bits AS stopBits,parity,
+                       timeout_ms AS timeoutMs,retry_count AS retryCount,poll_interval_seconds AS pollIntervalSeconds,
+                       enabled,remark
+                FROM dev_gateway_channel
+                WHERE gateway_id=?
+                ORDER BY channel_id
+                """, gatewayId)) {
+            Map<String, Object> item = new LinkedHashMap<>(row);
+            item.put("deviceCount", 0);
+            item.put("addresses", new ArrayList<Integer>());
+            channels.put(text(row.get("channelId")), item);
+        }
         for (Map<String, Object> device : devices) {
             String channelId = text(device.get("channelId"));
             if (channelId.isBlank()) channelId = "未绑定";
@@ -423,10 +551,60 @@ public class EdgeCollectionConfigService {
         return new ArrayList<>(channels.values());
     }
 
+    private Map<String, Object> normalizeChannel(Map<String, Object> body, String fixedChannelId) {
+        String channelId = fixedChannelId == null ? text(value(body, "channelId", "channel_id")) : fixedChannelId;
+        if (!channelId.matches("[A-Za-z0-9_-]{2,40}")) throw new BusinessException("通道编号只能包含字母、数字、下划线和短横线，长度 2-40");
+        String protocol = text(value(body, "protocol"));
+        if (protocol.isBlank()) protocol = "MODBUS_RTU";
+        if (!"MODBUS_RTU".equals(protocol.toUpperCase(Locale.ROOT))) {
+            throw new BusinessException("当前网关运行时只支持 MODBUS_RTU 主站");
+        }
+        String serialPort = text(value(body, "serialPort", "serial_port"));
+        if (serialPort.isBlank()) throw new BusinessException("请选择网关实际串口");
+        int baudRate = number(value(body, "baudRate", "baud_rate"), 9600);
+        int dataBits = number(value(body, "dataBits", "data_bits"), 8);
+        int stopBits = number(value(body, "stopBits", "stop_bits"), 1);
+        int timeoutMs = number(value(body, "timeoutMs", "timeout_ms"), 1000);
+        int retryCount = number(value(body, "retryCount", "retry_count"), 2);
+        int pollInterval = number(value(body, "pollIntervalSeconds", "poll_interval_seconds"), 300);
+        if (baudRate <= 0) throw new BusinessException("波特率必须大于 0");
+        if (dataBits < 5 || dataBits > 8) throw new BusinessException("数据位必须在 5-8");
+        if (stopBits < 1 || stopBits > 2) throw new BusinessException("停止位必须为 1 或 2");
+        if (timeoutMs < 100 || timeoutMs > 60_000) throw new BusinessException("超时时间必须在 100-60000 毫秒");
+        if (retryCount < 0 || retryCount > 10) throw new BusinessException("重试次数必须在 0-10");
+        if (pollInterval < 5 || pollInterval > 86_400) throw new BusinessException("默认周期必须在 5-86400 秒");
+        Map<String, Object> channel = new LinkedHashMap<>();
+        channel.put("channelId", channelId);
+        channel.put("channelName", text(value(body, "channelName", "channel_name")).isBlank() ? channelId : text(value(body, "channelName", "channel_name")));
+        channel.put("protocol", protocol.toUpperCase(Locale.ROOT));
+        channel.put("serialPort", serialPort);
+        channel.put("baudRate", baudRate);
+        channel.put("dataBits", dataBits);
+        channel.put("stopBits", stopBits);
+        String parity = text(value(body, "parity")).toUpperCase(Locale.ROOT);
+        parity = switch (parity) {
+            case "", "NONE" -> "N";
+            case "EVEN" -> "E";
+            case "ODD" -> "O";
+            default -> parity;
+        };
+        if (!List.of("N", "E", "O").contains(parity)) {
+            throw new BusinessException("校验位必须为无校验、偶校验或奇校验");
+        }
+        channel.put("parity", parity);
+        channel.put("timeoutMs", timeoutMs);
+        channel.put("retryCount", retryCount);
+        channel.put("pollIntervalSeconds", pollInterval);
+        channel.put("enabled", boolInt(value(body, "enabled"), true));
+        channel.put("remark", text(value(body, "remark")));
+        return channel;
+    }
+
     private Map<String, Object> summarize(List<Map<String, Object>> gateways) {
         long pending = gateways.stream().filter(row -> "PENDING".equals(row.get("applyStatus"))).count();
         long applied = gateways.stream().filter(row -> "APPLIED".equals(row.get("applyStatus"))).count();
-        long issue = gateways.stream().filter(row -> number(row.get("missingChannelCount"), 0) > 0).count();
+        long issue = gateways.stream().filter(row -> Boolean.FALSE.equals(row.get("precheckPassed"))
+                || number(row.get("missingChannelCount"), 0) > 0).count();
         return Map.of("gatewayCount", gateways.size(), "pendingCount", pending,
                 "appliedCount", applied, "issueGatewayCount", issue);
     }
@@ -493,6 +671,15 @@ public class EdgeCollectionConfigService {
 
     private String checksum(long gatewayId) {
         StringBuilder canonical = new StringBuilder();
+        for (Map<String, Object> channel : jdbcTemplate.queryForList("""
+                SELECT channel_id,protocol,serial_port,baud_rate,data_bits,stop_bits,parity,
+                       timeout_ms,retry_count,poll_interval_seconds,enabled
+                FROM dev_gateway_channel WHERE gateway_id=? ORDER BY channel_id
+                """, gatewayId)) {
+            canonical.append("channel:")
+                    .append(channel.values().stream().map(Objects::toString).reduce((a, b) -> a + "|" + b).orElse(""))
+                    .append('\n');
+        }
         for (Map<String, Object> device : devices(gatewayId)) {
             canonical.append("device:")
                     .append(text(device.get("deviceSn"))).append('|')
@@ -503,14 +690,15 @@ public class EdgeCollectionConfigService {
                     .append(number(device.get("collectIntervalSeconds"), 0)).append('\n');
         }
         for (Map<String, Object> row : jdbcTemplate.queryForList("""
-                SELECT p.point_code,p.function_code,p.register_address,p.register_length,p.value_type,
-                       p.byte_order,p.scale_factor,p.offset_value,p.required
-                FROM dev_thing_model_point p
-                JOIN dev_device d ON d.model_version_id=p.model_version_id
-                WHERE d.gateway_id=? AND p.enabled=1
-                GROUP BY p.model_version_id,p.point_code,p.function_code,p.register_address,p.register_length,
-                         p.value_type,p.byte_order,p.scale_factor,p.offset_value,p.required
-                ORDER BY p.model_version_id,p.sort,p.id
+                SELECT v.id,rb.block_code,rb.function_code,rb.start_address,rb.register_count,
+                       pf.field_code,pf.register_offset,pf.register_length,pf.value_type,pf.byte_order,
+                       pf.bit_offset,pf.bit_length,pf.decode_factor,pf.decode_offset,
+                       b.point_code,b.canonical_factor,b.canonical_offset,b.required
+                FROM dev_device d JOIN dev_device_model_version v ON v.id=d.model_version_id
+                JOIN dev_protocol_read_block rb ON rb.protocol_version_id=v.protocol_profile_version_id AND rb.poll_mode='CYCLIC'
+                JOIN dev_protocol_field pf ON pf.read_block_id=rb.id
+                JOIN dev_model_point_binding b ON b.model_version_id=v.id AND b.protocol_field_id=pf.id
+                WHERE d.gateway_id=? GROUP BY v.id,rb.id,pf.id,b.id ORDER BY v.id,rb.sort,pf.sort,b.sort
                 """, gatewayId)) {
             canonical.append("point:")
                     .append(row.values().stream().map(Objects::toString).reduce((a, b) -> a + "|" + b).orElse(""))
