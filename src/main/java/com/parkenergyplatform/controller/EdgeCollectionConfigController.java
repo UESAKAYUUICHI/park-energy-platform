@@ -6,6 +6,7 @@ import com.parkenergyplatform.common.ApiResponse;
 import com.parkenergyplatform.service.EdgeCollectionConfigService;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
@@ -42,6 +43,37 @@ public class EdgeCollectionConfigController {
         return ApiResponse.success(service.precheck(gatewayId));
     }
 
+    @GetMapping("/gateways/{gatewayId}/device-candidates")
+    @SaCheckPermission("archive:list")
+    public ApiResponse<Map<String, Object>> deviceCandidates(@PathVariable long gatewayId, HttpServletRequest request) {
+        return ApiResponse.success(service.deviceCandidates(gatewayId, queryParams(request)));
+    }
+
+    @PostMapping("/gateways/{gatewayId}/channels")
+    @SaCheckPermission("archive:edit")
+    @OperationLog(module = "边缘采集配置", operation = "新增网关通道")
+    public ApiResponse<Map<String, Object>> createChannel(@PathVariable long gatewayId,
+                                                          @RequestBody Map<String, Object> body) {
+        return ApiResponse.success(service.createChannel(gatewayId, body));
+    }
+
+    @PutMapping("/gateways/{gatewayId}/channels/{channelId}")
+    @SaCheckPermission("archive:edit")
+    @OperationLog(module = "边缘采集配置", operation = "修改网关通道")
+    public ApiResponse<Map<String, Object>> updateChannel(@PathVariable long gatewayId,
+                                                          @PathVariable String channelId,
+                                                          @RequestBody Map<String, Object> body) {
+        return ApiResponse.success(service.updateChannel(gatewayId, channelId, body));
+    }
+
+    @DeleteMapping("/gateways/{gatewayId}/channels/{channelId}")
+    @SaCheckPermission("archive:edit")
+    @OperationLog(module = "边缘采集配置", operation = "删除网关通道")
+    public ApiResponse<Map<String, Object>> deleteChannel(@PathVariable long gatewayId,
+                                                          @PathVariable String channelId) {
+        return ApiResponse.success(service.deleteChannel(gatewayId, channelId));
+    }
+
     @PutMapping("/devices/{deviceId}/binding")
     @SaCheckPermission("archive:edit")
     @OperationLog(module = "边缘采集配置", operation = "修改设备采集绑定")
@@ -55,14 +87,6 @@ public class EdgeCollectionConfigController {
     @OperationLog(module = "边缘采集配置", operation = "试采设备")
     public ApiResponse<Map<String, Object>> probeDevice(@PathVariable long deviceId) {
         return ApiResponse.success(service.probeDevice(deviceId));
-    }
-
-    @PutMapping("/model-versions/{modelVersionId}/points")
-    @SaCheckPermission("archive:edit")
-    @OperationLog(module = "边缘采集配置", operation = "保存模型采集点表")
-    public ApiResponse<Map<String, Object>> replaceModelPoints(@PathVariable long modelVersionId,
-                                                               @RequestBody Map<String, Object> body) {
-        return ApiResponse.success(service.replaceModelPoints(modelVersionId, body));
     }
 
     @PostMapping("/gateways/{gatewayId}/publish")

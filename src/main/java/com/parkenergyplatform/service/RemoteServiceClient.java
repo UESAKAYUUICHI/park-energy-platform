@@ -87,7 +87,11 @@ public class RemoteServiceClient {
         try {
             return request.retrieve().body(mapType());
         } catch (RestClientException ex) {
-            throw new BusinessException(503, serviceName + " 服务调用失败: " + uri);
+            String detail = ex.getMessage();
+            if (detail == null || detail.isBlank()) {
+                detail = ex.getClass().getSimpleName();
+            }
+            throw new BusinessException(503, serviceName + " 服务调用失败: " + uri + " (" + detail + ")");
         }
     }
 }

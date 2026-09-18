@@ -197,7 +197,7 @@ public class DeviceProvisionService {
         if (intValue(device.get("settlement_enabled"), 0) == 1) {
             throw new BusinessException("结算设备解绑前必须先在设备上下文中关闭计量投运");
         }
-        jdbcTemplate.update("UPDATE dev_device SET gateway_id=NULL,protocol_addr=NULL WHERE id=?", deviceId);
+        jdbcTemplate.update("UPDATE dev_device SET gateway_id=NULL,edge_channel_id=NULL,protocol_addr=NULL,update_time=NOW() WHERE id=?", deviceId);
         recordDeployment(deviceId, "UNBIND", sourceGatewayId, null, null, text(value(body, "remark")));
         return deviceDetail(deviceId);
     }
