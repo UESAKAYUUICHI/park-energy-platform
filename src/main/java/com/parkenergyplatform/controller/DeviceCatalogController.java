@@ -205,6 +205,14 @@ public class DeviceCatalogController {
         return ApiResponse.success(catalogService.replacePoints(versionId, body));
     }
 
+    @PostMapping("/versions/{versionId}/apply-protocol-template")
+    @SaCheckPermission(value = {"catalog:edit", "archive:edit"}, mode = SaMode.OR)
+    @OperationLog(module = "产品目录", operation = "应用协议模板")
+    public ApiResponse<Map<String, Object>> applyProtocolTemplate(@PathVariable long versionId,
+                                                                  @RequestBody Map<String, Object> body) {
+        return ApiResponse.success(catalogService.applyProtocolTemplate(versionId, body));
+    }
+
     @PostMapping("/versions/{versionId}/validate")
     @SaCheckPermission(value = {"catalog:edit", "archive:edit"}, mode = SaMode.OR)
     public ApiResponse<Map<String, Object>> validate(@PathVariable long versionId) {
