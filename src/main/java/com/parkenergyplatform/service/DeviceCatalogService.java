@@ -45,9 +45,6 @@ public class DeviceCatalogService {
     private static final String DISABLED = "DISABLED";
     private static final Set<String> PROTOCOL_TYPES = Set.of("JSON", "MODBUS_RTU", "MODBUS_TCP");
     private static final Set<String> POINT_TYPES = Set.of("DOUBLE", "INTEGER", "LONG", "DECIMAL", "STRING", "BOOLEAN");
-    private static final Set<String> MODBUS_VALUE_TYPES = Set.of("INT16", "UINT16", "INT32", "UINT32", "FLOAT32", "FLOAT64", "BOOLEAN");
-    private static final Set<String> MODBUS_FUNCTION_CODES = Set.of("01", "02", "03", "04", "1", "2", "3", "4");
-    private static final Set<String> BYTE_ORDERS = Set.of("AB", "BA", "ABCD", "CDAB", "BADC", "DCBA");
     private static final Set<String> IMAGE_CONTENT_TYPES = Set.of("image/jpeg", "image/png", "image/webp", "image/gif");
 
     private final JdbcTemplate jdbcTemplate;
@@ -567,20 +564,36 @@ public class DeviceCatalogService {
                 """, seriesId);
         String modelCode = text(value(body, "modelCode", "model_code"));
         String modelName = text(value(body, "modelName", "model_name"));
+        Long protocolVersionId = longValue(value(body, "protocolProfileVersionId", "protocol_profile_version_id"));
+        String protocolType = textOr(value(body, "protocolType", "protocol_type"), "JSON");
+        if (protocolVersionId != null) {
+            Map<String, Object> protocol = single("""
+                    SELECT v.id,p.transport_type FROM dev_protocol_profile_version v
+                    JOIN dev_protocol_profile p ON p.id=v.profile_id
+                    WHERE v.id=? AND v.status='PUBLISHED' AND p.enabled=1
+                    """, protocolVersionId);
+            protocolType = text(protocol.get("transport_type"));
+        }
         long modelId = insert("INSERT INTO dev_device_model(series_id,model_code,model_name,description,image_object_key,status) VALUES(?,?,?,?,?,?)",
                 seriesId, modelCode, modelName, text(value(body, "description")),
                 text(value(body, "imageObjectKey", "image_object_key")), DRAFT);
         String technicalCode = technicalTypeCode(seriesId, modelCode, 1);
         long deviceTypeId = insert("INSERT INTO dev_device_type(type_code,type_name,protocol_type,description,enabled) VALUES(?,?,?,?,0)",
-                technicalCode, modelName + " V1", textOr(value(body, "protocolType", "protocol_type"), "JSON"),
+                technicalCode, modelName + " V1", protocolType,
                 "Catalog model " + modelCode + " draft V1");
         long versionId = insert("""
                 INSERT INTO dev_device_model_version
-                (model_id,version_no,version_name,device_type_id,status,collect_interval_seconds,quality_threshold_pct,remark)
-                VALUES(?,1,'V1',?,'DRAFT',?,?,?)
-                """, modelId, deviceTypeId, longOrDefault(value(body, "collectIntervalSeconds"), 300),
+                (model_id,version_no,version_name,device_type_id,protocol_profile_version_id,status,collect_interval_seconds,quality_threshold_pct,remark)
+                VALUES(?,1,'V1',?,?,'DRAFT',?,?,?)
+                """, modelId, deviceTypeId, protocolVersionId, longOrDefault(value(body, "collectIntervalSeconds"), 300),
                 decimalText(value(body, "qualityThresholdPct"), "80"), text(value(body, "remark")));
-        Map<String, Object> result = detail(modelId, versionId);
+        Map<String, Object> result;
+        if (protocolVersionId == null) {
+            result = detail(modelId, versionId);
+        } else {
+            applyProtocolTemplate(versionId, Map.of("protocolProfileVersionId", protocolVersionId));
+            result = publish(versionId);
+        }
         result.put("series", series);
         return result;
     }
@@ -626,20 +639,25 @@ public class DeviceCatalogService {
                 ORDER BY g.sort,g.id,a.sort,a.id
                 """, selectedVersionId, longValue(model.get("category_id"))));
         data.put("points", jdbcTemplate.queryForList("""
-                SELECT p.*, pg.group_name AS point_group_name, m.protocol_type AS mapping_protocol_type, m.source_path, m.function_code,
-                       m.register_address, m.register_length, m.value_type, m.byte_order,
-                       m.scale_factor, m.offset_value, m.expression, m.required
+                SELECT p.*, pg.group_name AS point_group_name,b.protocol_field_id,b.canonical_factor,b.canonical_offset,
+                       b.display_factor,b.display_unit,b.required,f.field_code,f.field_name,f.document_address,
+                       f.value_type,f.raw_unit,rb.function_code,rb.start_address,rb.register_count
                 FROM dev_point_definition p
                 LEFT JOIN dev_standard_point sp ON sp.id=p.standard_point_id
                 LEFT JOIN dev_standard_point_group pg ON pg.id=sp.group_id
-                LEFT JOIN dev_point_mapping m ON m.device_type_id=p.device_type_id AND m.point_code=p.point_code
+                LEFT JOIN dev_device_model_version mv ON mv.device_type_id=p.device_type_id
+                LEFT JOIN dev_model_point_binding b ON b.model_version_id=mv.id AND BINARY b.point_code=BINARY p.point_code
+                LEFT JOIN dev_protocol_field f ON f.id=b.protocol_field_id
+                LEFT JOIN dev_protocol_read_block rb ON rb.id=f.read_block_id
                 WHERE p.device_type_id=? ORDER BY p.sort,p.id
                 """, deviceTypeId));
         data.put("devices", jdbcTemplate.queryForList("""
-                SELECT d.id,d.device_sn,d.device_name,d.org_id,d.gateway_id,d.status,o.org_name,g.gateway_name,g.gateway_sn
+                SELECT d.id,d.device_sn,d.device_name,d.org_id,d.gateway_id,d.edge_channel_id,d.protocol_addr,
+                       d.status,o.org_name,g.gateway_name,g.gateway_sn,gc.channel_name,gc.serial_port
                 FROM dev_device d
                 LEFT JOIN dev_org o ON o.id=d.org_id
                 LEFT JOIN dev_gateway g ON g.id=d.gateway_id
+                LEFT JOIN dev_gateway_channel gc ON gc.gateway_id=d.gateway_id AND BINARY gc.channel_id=BINARY d.edge_channel_id
                 WHERE d.model_version_id=? ORDER BY d.id DESC LIMIT 100
                 """, selectedVersionId));
         return data;
@@ -740,6 +758,62 @@ public class DeviceCatalogService {
             jdbcTemplate.update("UPDATE dev_device_type SET protocol_type=? WHERE id=?",
                     protocolType, longValue(version.get("device_type_id")));
         }
+        if (value(body, "protocolProfileVersionId", "protocol_profile_version_id") != null) {
+            Object rawProtocolVersionId = value(body, "protocolProfileVersionId", "protocol_profile_version_id");
+            Long protocolVersionId = longValue(rawProtocolVersionId);
+            if (protocolVersionId == null) {
+                jdbcTemplate.update("UPDATE dev_device_model_version SET protocol_profile_version_id=NULL WHERE id=?", versionId);
+            } else {
+                Map<String, Object> protocol = single("""
+                        SELECT v.id,p.transport_type FROM dev_protocol_profile_version v
+                        JOIN dev_protocol_profile p ON p.id=v.profile_id
+                        WHERE v.id=? AND v.status='PUBLISHED' AND p.enabled=1
+                        """, protocolVersionId);
+                jdbcTemplate.update("UPDATE dev_device_model_version SET protocol_profile_version_id=? WHERE id=?", protocolVersionId, versionId);
+                jdbcTemplate.update("UPDATE dev_device_type SET protocol_type=? WHERE id=?",
+                        protocol.get("transport_type"), longValue(version.get("device_type_id")));
+            }
+        }
+        return detail(longValue(version.get("model_id")), versionId);
+    }
+
+    @Transactional
+    public Map<String, Object> applyProtocolTemplate(long versionId, Map<String, Object> body) {
+        Map<String, Object> version = requireDraft(versionId);
+        Long protocolVersionId = requiredLong(body, "protocolProfileVersionId", "请选择协议模板");
+        Map<String, Object> protocol = single("""
+                SELECT v.id,p.transport_type FROM dev_protocol_profile_version v
+                JOIN dev_protocol_profile p ON p.id=v.profile_id
+                WHERE v.id=? AND v.status='PUBLISHED' AND p.enabled=1
+                """, protocolVersionId);
+        jdbcTemplate.update("UPDATE dev_device_model_version SET protocol_profile_version_id=? WHERE id=?", protocolVersionId, versionId);
+        jdbcTemplate.update("UPDATE dev_device_type SET protocol_type=? WHERE id=?",
+                protocol.get("transport_type"), longValue(version.get("device_type_id")));
+
+        List<Map<String, Object>> attributes = jdbcTemplate.queryForList("""
+                SELECT t.attribute_id AS attributeId,t.attribute_value_option_id AS attributeValueOptionId,
+                       COALESCE(o.value_text,t.attribute_value,a.default_value,'') AS attributeValue
+                FROM dev_protocol_attribute_template t
+                JOIN dev_attribute_definition a ON a.id=t.attribute_id AND a.enabled=1
+                LEFT JOIN dev_attribute_value_option o ON o.id=t.attribute_value_option_id
+                WHERE t.protocol_version_id=?
+                ORDER BY t.sort,t.id
+                """, protocolVersionId);
+        replaceAttributes(versionId, attributes);
+
+        List<Map<String, Object>> fields = jdbcTemplate.queryForList("""
+                SELECT f.id AS protocolFieldId,f.standard_point_id AS standardPointId,
+                       sp.point_code AS pointCode,sp.point_name AS pointName,sp.data_type AS dataType,
+                       COALESCE(sp.unit,f.raw_unit,'') AS unit,sp.business_role AS businessRole,
+                       f.decode_factor AS canonicalFactor,f.decode_offset AS canonicalOffset,
+                       1 AS displayFactor,COALESCE(sp.unit,f.raw_unit,'') AS displayUnit,
+                       f.required AS required,f.sort AS sort
+                FROM dev_protocol_field f
+                JOIN dev_standard_point sp ON sp.id=f.standard_point_id AND sp.enabled=1
+                WHERE f.protocol_version_id=?
+                ORDER BY f.sort,f.id
+                """, protocolVersionId);
+        replacePoints(versionId, fields);
         return detail(longValue(version.get("model_id")), versionId);
     }
 
@@ -762,8 +836,12 @@ public class DeviceCatalogService {
                     WHERE id=? AND enabled=1 AND (category_id IS NULL OR category_id=?)
                     """, attributeId, categoryId);
             Long optionId = longValue(value(item, "attributeValueOptionId", "attribute_value_option_id", "optionId", "option_id"));
-            Map<String, Object> option = optionId == null ? null : single("SELECT * FROM dev_attribute_value_option WHERE id=? AND attribute_id=? AND enabled=1", optionId, attributeId);
-            String attributeValue = option == null ? text(value(item, "attributeValue", "attribute_value")) : text(option.get("value_text"));
+            String rawAttributeValue = text(value(item, "attributeValue", "attribute_value"));
+            Map<String, Object> option = optionId == null
+                    ? resolveAttributeOption(attributeId, rawAttributeValue, text(definition.get("default_value")))
+                    : single("SELECT * FROM dev_attribute_value_option WHERE id=? AND attribute_id=? AND enabled=1", optionId, attributeId);
+            if (option != null) optionId = longValue(option.get("id"));
+            String attributeValue = option == null ? rawAttributeValue : text(option.get("value_text"));
             if (option == null && count("SELECT COUNT(*) FROM dev_attribute_value_option WHERE attribute_id=? AND enabled=1", attributeId) > 0) {
                 throw new BusinessException(text(definition.get("attribute_name")) + " 必须选择一个固定值");
             }
@@ -784,11 +862,38 @@ public class DeviceCatalogService {
         return detail(longValue(version.get("model_id")), versionId);
     }
 
+    private Map<String, Object> resolveAttributeOption(Long attributeId, String value, String fallbackValue) {
+        List<Map<String, Object>> options = jdbcTemplate.queryForList(
+                "SELECT * FROM dev_attribute_value_option WHERE attribute_id=? AND enabled=1 ORDER BY sort,id",
+                attributeId);
+        if (options.isEmpty()) return null;
+        String normalizedValue = normalizeOptionText(value);
+        String normalizedFallback = normalizeOptionText(fallbackValue);
+        for (Map<String, Object> option : options) {
+            if (Objects.equals(normalizedValue, normalizeOptionText(option.get("value_text")))) return option;
+        }
+        if (!StringUtils.hasText(value)) {
+            for (Map<String, Object> option : options) {
+                if (Objects.equals(normalizedFallback, normalizeOptionText(option.get("value_text")))) return option;
+            }
+        }
+        return null;
+    }
+
+    private String normalizeOptionText(Object value) {
+        String text = text(value);
+        if (!StringUtils.hasText(text)) return "";
+        return text.toLowerCase(Locale.ROOT)
+                .replace('×', 'x')
+                .replaceAll("\\s+", "");
+    }
+
     @Transactional
     public Map<String, Object> replacePoints(long versionId, List<Map<String, Object>> points) {
         Map<String, Object> version = requireDraft(versionId);
         long deviceTypeId = longValue(version.get("device_type_id"));
-        jdbcTemplate.update("DELETE FROM dev_point_mapping WHERE device_type_id=?", deviceTypeId);
+        boolean protocolSelected = version.get("protocol_profile_version_id") != null;
+        jdbcTemplate.update("DELETE FROM dev_model_point_binding WHERE model_version_id=?", versionId);
         jdbcTemplate.update("DELETE FROM dev_point_definition WHERE device_type_id=?", deviceTypeId);
         int sort = 0;
         Set<String> pointCodes = new HashSet<>();
@@ -814,22 +919,24 @@ public class DeviceCatalogService {
                     value(point, "statEnabled", "stat_enabled") == null ? 1 : boolInt(value(point, "statEnabled", "stat_enabled")),
                     longOrDefault(value(point, "sort"), ++sort),
                     value(point, "enabled") == null ? 1 : boolInt(value(point, "enabled")));
-            boolean hasMapping = StringUtils.hasText(text(value(point, "sourcePath", "source_path")))
-                    || value(point, "registerAddress", "register_address") != null;
-            if (hasMapping) {
-                String mappingProtocol = normalizeProtocol(value(point, "mappingProtocolType", "mapping_protocol_type", "protocolType", "protocol_type"));
-                jdbcTemplate.update("""
-                        INSERT INTO dev_point_mapping
-                        (device_type_id,point_code,protocol_type,source_path,function_code,register_address,register_length,
-                         value_type,byte_order,scale_factor,offset_value,expression,required)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-                        """, deviceTypeId, code, mappingProtocol,
-                        text(value(point, "sourcePath", "source_path")), text(value(point, "functionCode", "function_code")),
-                        value(point, "registerAddress", "register_address"), value(point, "registerLength", "register_length"),
-                        text(value(point, "valueType", "value_type")), text(value(point, "byteOrder", "byte_order")),
-                        decimalText(value(point, "scaleFactor", "scale_factor"), "1"), decimalText(value(point, "offsetValue", "offset_value"), "0"),
-                        text(value(point, "expression")), value(point, "required") == null ? 1 : boolInt(value(point, "required")));
-            }
+            Long fieldId = longValue(value(point, "protocolFieldId", "protocol_field_id"));
+            if (fieldId == null && protocolSelected) throw new BusinessException("测点 " + code + " 必须绑定协议字段");
+            if (fieldId == null) continue;
+            Long fieldExists = count("""
+                    SELECT COUNT(*) FROM dev_protocol_field f
+                    JOIN dev_device_model_version v ON v.protocol_profile_version_id=f.protocol_version_id
+                    WHERE v.id=? AND f.id=?
+                    """, versionId, fieldId);
+            if (fieldExists == 0) throw new BusinessException("测点 " + code + " 绑定的字段不属于当前协议版本");
+            jdbcTemplate.update("""
+                    INSERT INTO dev_model_point_binding(model_version_id,point_code,protocol_field_id,canonical_factor,
+                      canonical_offset,display_factor,display_unit,required,sort) VALUES(?,?,?,?,?,?,?,?,?)
+                    """, versionId, code, fieldId,
+                    decimalText(value(point, "canonicalFactor", "canonical_factor"), "1"),
+                    decimalText(value(point, "canonicalOffset", "canonical_offset"), "0"),
+                    decimalText(value(point, "displayFactor", "display_factor"), "1"),
+                    text(value(point, "displayUnit", "display_unit", "unit")),
+                    value(point, "required") == null ? 1 : boolInt(value(point, "required")), sort * 10);
         }
         return detail(longValue(version.get("model_id")), versionId);
     }
@@ -839,7 +946,7 @@ public class DeviceCatalogService {
         Map<String, Object> catalogState = single("""
                 SELECT c.enabled AS category_enabled,b.enabled AS brand_enabled,s.enabled AS series_enabled,
                        m.status AS model_status,v.status AS version_status,t.protocol_type,v.collect_interval_seconds,v.quality_threshold_pct,
-                       v.device_type_id,s.category_id
+                       v.device_type_id,v.protocol_profile_version_id,s.category_id
                 FROM dev_device_model_version v JOIN dev_device_type t ON t.id=v.device_type_id
                 JOIN dev_device_model m ON m.id=v.model_id JOIN dev_product_series s ON s.id=m.series_id
                 JOIN dev_brand b ON b.id=s.brand_id JOIN dev_device_category c ON c.id=s.category_id WHERE v.id=?
@@ -878,15 +985,16 @@ public class DeviceCatalogService {
         checks.add(check("测点定义", pointCount > 0, pointCount > 0 ? "已配置 " + pointCount + " 个测点" : "至少需要一个启用测点"));
         Long missingMappings = count("""
                 SELECT COUNT(*) FROM dev_point_definition p
-                LEFT JOIN dev_point_mapping m ON m.device_type_id=p.device_type_id AND m.point_code=p.point_code
-                WHERE p.device_type_id=? AND p.enabled=1 AND m.id IS NULL
-                """, deviceTypeId);
-        checks.add(check("协议映射", missingMappings == 0 && pointCount > 0,
-                missingMappings == 0 ? "测点映射完整" : "有 " + missingMappings + " 个测点缺少协议映射"));
-        List<Map<String, Object>> mappings = jdbcTemplate.queryForList("SELECT * FROM dev_point_mapping WHERE device_type_id=?", deviceTypeId);
-        long invalidMappings = mappings.stream().filter(mapping -> mappingError(protocolType, mapping) != null).count();
-        checks.add(check("协议字段", invalidMappings == 0 && missingMappings == 0,
-                invalidMappings == 0 ? "协议专用字段合法" : "有 " + invalidMappings + " 个协议映射字段不合法"));
+                LEFT JOIN dev_model_point_binding b ON b.model_version_id=? AND BINARY b.point_code=BINARY p.point_code
+                WHERE p.device_type_id=? AND p.enabled=1 AND b.id IS NULL
+                """, versionId, deviceTypeId);
+        Long protocolVersionId = longValue(catalogState.get("protocol_profile_version_id"));
+        boolean protocolBound = protocolVersionId != null && count("SELECT COUNT(*) FROM dev_protocol_profile_version WHERE id=? AND status='PUBLISHED'", protocolVersionId) == 1;
+        boolean fieldbus = "MODBUS_RTU".equals(protocolType) || "MODBUS_TCP".equals(protocolType);
+        checks.add(check("厂商协议", !fieldbus || protocolBound,
+                !fieldbus ? "JSON 设备直接上报标准 points" : protocolBound ? "已绑定已发布协议版本" : "请选择并绑定已发布的厂商协议"));
+        checks.add(check("测点绑定", !fieldbus || (missingMappings == 0 && pointCount > 0),
+                !fieldbus ? "JSON 测点无需字段总线绑定" : missingMappings == 0 ? "业务测点均已绑定协议字段" : "有 " + missingMappings + " 个测点缺少协议字段绑定"));
         Long invalidBillable = count("""
                 SELECT COUNT(*) FROM dev_point_definition
                 WHERE device_type_id=? AND billable=1
@@ -928,36 +1036,16 @@ public class DeviceCatalogService {
         if (!Objects.equals(longValue(source.get("model_id")), modelId)) throw new BusinessException("源版本不属于当前型号");
         Integer next = jdbcTemplate.queryForObject("SELECT COALESCE(MAX(version_no),0)+1 FROM dev_device_model_version WHERE model_id=?", Integer.class, modelId);
         int versionNo = next == null ? 1 : next;
-        long sourceTypeId = longValue(source.get("device_type_id"));
-        Map<String, Object> sourceType = single("SELECT * FROM dev_device_type WHERE id=?", sourceTypeId);
         long newTypeId = insert("INSERT INTO dev_device_type(type_code,type_name,protocol_type,description,enabled) VALUES(?,?,?,?,0)",
                 technicalTypeCode(longValue(model.get("series_id")), text(model.get("model_code")), versionNo),
-                text(model.get("model_name")) + " V" + versionNo, textOr(sourceType.get("protocol_type"), "JSON"),
+                text(model.get("model_name")) + " V" + versionNo, "JSON",
                 "Catalog model " + model.get("model_code") + " draft V" + versionNo);
         long versionId = insert("""
                 INSERT INTO dev_device_model_version
-                (model_id,version_no,version_name,device_type_id,status,collect_interval_seconds,quality_threshold_pct,source_version_id,remark)
-                VALUES(?,?,?,?,?,?,?,?,?)
-                """, modelId, versionNo, "V" + versionNo, newTypeId, DRAFT, source.get("collect_interval_seconds"),
+                (model_id,version_no,version_name,device_type_id,protocol_profile_version_id,status,collect_interval_seconds,quality_threshold_pct,source_version_id,remark)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                """, modelId, versionNo, "V" + versionNo, newTypeId, null, DRAFT, source.get("collect_interval_seconds"),
                 source.get("quality_threshold_pct"), longValue(source.get("id")), source.get("remark"));
-        jdbcTemplate.update("""
-                INSERT INTO dev_model_attribute_value(model_version_id,attribute_id,attribute_value_option_id,attribute_value)
-                SELECT ?,attribute_id,attribute_value_option_id,attribute_value FROM dev_model_attribute_value WHERE model_version_id=?
-                """, versionId, longValue(source.get("id")));
-        jdbcTemplate.update("""
-                INSERT INTO dev_point_definition
-                (device_type_id,standard_point_id,point_code,point_name,data_type,unit,precision_scale,business_role,billable,stat_enabled,sort,enabled)
-                SELECT ?,standard_point_id,point_code,point_name,data_type,unit,precision_scale,business_role,billable,stat_enabled,sort,enabled
-                FROM dev_point_definition WHERE device_type_id=?
-                """, newTypeId, sourceTypeId);
-        jdbcTemplate.update("""
-                INSERT INTO dev_point_mapping
-                (device_type_id,point_code,protocol_type,source_path,function_code,register_address,register_length,value_type,
-                 byte_order,scale_factor,offset_value,expression,required)
-                SELECT ?,point_code,protocol_type,source_path,function_code,register_address,register_length,value_type,
-                       byte_order,scale_factor,offset_value,expression,required
-                FROM dev_point_mapping WHERE device_type_id=?
-                """, newTypeId, sourceTypeId);
         return detail(modelId, versionId);
     }
 
@@ -993,7 +1081,6 @@ public class DeviceCatalogService {
         Long references = count("SELECT COUNT(*) FROM dev_device WHERE model_version_id=? OR device_type_id=?", versionId, longValue(version.get("device_type_id")));
         if (references > 0) throw new BusinessException("该版本已有设备引用，不能删除");
         long deviceTypeId = longValue(version.get("device_type_id"));
-        jdbcTemplate.update("DELETE FROM dev_point_mapping WHERE device_type_id=?", deviceTypeId);
         jdbcTemplate.update("DELETE FROM dev_point_definition WHERE device_type_id=?", deviceTypeId);
         jdbcTemplate.update("DELETE FROM dev_model_attribute_value WHERE model_version_id=?", versionId);
         jdbcTemplate.update("DELETE FROM dev_device_model_version WHERE id=?", versionId);
@@ -1256,40 +1343,6 @@ public class DeviceCatalogService {
         try {
             return objectMapper.readTree(text(value));
         } catch (Exception exception) {
-            return null;
-        }
-    }
-
-    private String mappingError(String versionProtocol, Map<String, Object> mapping) {
-        String mappingProtocol = normalizeUpper(mapping.get("protocol_type"), "");
-        if ("MODBUS".equals(mappingProtocol)) mappingProtocol = "MODBUS_RTU";
-        if (!Objects.equals(versionProtocol, mappingProtocol)) return "映射协议与版本协议不一致";
-        if ("JSON".equals(versionProtocol)) {
-            String path = text(mapping.get("source_path"));
-            return StringUtils.hasText(path) && path.startsWith("$") ? null : "JSONPath 必须以 $ 开头";
-        }
-        String functionCode = text(mapping.get("function_code"));
-        Long address = safeLong(mapping.get("register_address"));
-        Long length = safeLong(mapping.get("register_length"));
-        String valueType = normalizeUpper(mapping.get("value_type"), "");
-        String byteOrder = normalizeUpper(mapping.get("byte_order"), "");
-        if (!MODBUS_FUNCTION_CODES.contains(textOr(functionCode, ""))) return "MODBUS 功能码不合法";
-        if (address == null || address < 0) return "MODBUS 寄存器地址不合法";
-        if (length == null || length <= 0) return "MODBUS 寄存器长度不合法";
-        if (!MODBUS_VALUE_TYPES.contains(valueType)) return "MODBUS 值类型不合法";
-        if (!BYTE_ORDERS.contains(byteOrder)) return "MODBUS 字节序不合法";
-        int expectedLength = Set.of("INT16", "UINT16", "BOOLEAN").contains(valueType) ? 1
-                : "FLOAT64".equals(valueType) ? 4 : 2;
-        if (length != expectedLength) return "寄存器长度与值类型不匹配";
-        if (expectedLength == 1 && !Set.of("AB", "BA").contains(byteOrder)) return "单寄存器字节序不合法";
-        if (expectedLength > 1 && Set.of("AB", "BA").contains(byteOrder)) return "多寄存器字节序不合法";
-        return null;
-    }
-
-    private Long safeLong(Object value) {
-        try {
-            return longValue(value);
-        } catch (RuntimeException exception) {
             return null;
         }
     }
