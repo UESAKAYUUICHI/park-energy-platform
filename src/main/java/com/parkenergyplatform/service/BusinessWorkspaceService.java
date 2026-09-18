@@ -42,8 +42,9 @@ public class BusinessWorkspaceService {
         putSafely(data, "deviceHealth", () -> {
             List<Object> deviceHealthArgs = new ArrayList<>();
             return jdbcTemplate.queryForList("""
-                SELECT d.id, d.device_sn, d.device_name, d.status, d.install_location,
-                       g.gateway_sn, g.online_status, o.org_name, t.type_name
+                SELECT d.id, d.device_sn, d.device_name, d.status, d.online_status, d.last_online_time,
+                       d.install_location, g.gateway_sn, g.online_status AS gateway_online_status,
+                       o.org_name, t.type_name
                 FROM dev_device d
                 LEFT JOIN dev_gateway g ON g.id = d.gateway_id
                 LEFT JOIN dev_org o ON o.id = d.org_id
@@ -58,8 +59,8 @@ public class BusinessWorkspaceService {
             List<Object> statusArgs = new ArrayList<>();
             List<Map<String, Object>> rows = jdbcTemplate.queryForList("""
                 SELECT COUNT(*) AS total_count,
-                       SUM(CASE WHEN d.status = 1 AND COALESCE(g.online_status, 0) = 1 THEN 1 ELSE 0 END) AS online_count,
-                       SUM(CASE WHEN d.status <> 1 OR COALESCE(g.online_status, 0) <> 1 THEN 1 ELSE 0 END) AS offline_count
+                       SUM(CASE WHEN d.status = 1 AND COALESCE(d.online_status, 0) = 1 THEN 1 ELSE 0 END) AS online_count,
+                       SUM(CASE WHEN d.status <> 1 OR COALESCE(d.online_status, 0) <> 1 THEN 1 ELSE 0 END) AS offline_count
                 FROM dev_device d
                 LEFT JOIN dev_gateway g ON g.id = d.gateway_id
                 WHERE 1 = 1
@@ -109,7 +110,7 @@ public class BusinessWorkspaceService {
         data.put("deviceTypes", jdbcTemplate.queryForList("SELECT * FROM dev_device_type ORDER BY id DESC LIMIT 80"));
         data.put("devices", deviceRows());
         data.put("pointDefinitions", jdbcTemplate.queryForList("SELECT * FROM dev_point_definition ORDER BY device_type_id, sort, id"));
-        data.put("pointMappings", jdbcTemplate.queryForList("SELECT * FROM dev_point_mapping ORDER BY device_type_id, id"));
+        data.put("pointBindings", jdbcTemplate.queryForList("SELECT * FROM dev_model_point_binding ORDER BY model_version_id, sort, id"));
         data.put("configChecks", configChecks());
         return data;
     }
@@ -247,35 +248,6 @@ public class BusinessWorkspaceService {
         return remoteServiceClient.postAccess("/api/access/commands", body);
     }
 
-    public Map<String, Object> parseTest(Map<String, Object> request) {
-        long deviceTypeId = requiredLong(request.get("deviceTypeId"), "deviceTypeId");
-        Object samplePayload = request.get("samplePayload");
-        if (samplePayload == null) {
-            throw new BusinessException("samplePayload 不能为空");
-        }
-        JsonNode root = objectMapper.valueToTree(samplePayload);
-        Map<String, Object> points = new LinkedHashMap<>();
-        List<String> errors = new ArrayList<>();
-        List<Map<String, Object>> mappings = jdbcTemplate.queryForList(
-                "SELECT * FROM dev_point_mapping WHERE device_type_id = ? ORDER BY id", deviceTypeId);
-        for (Map<String, Object> mapping : mappings) {
-            String pointCode = Objects.toString(mapping.get("point_code"), "");
-            String sourcePath = Objects.toString(mapping.get("source_path"), "");
-            Object raw = readJsonPath(root, sourcePath);
-            if (raw == null) {
-                if (Objects.equals(numberOrZero(mapping.get("required")).intValue(), 1)) {
-                    errors.add(pointCode + " 缺少来源字段 " + sourcePath);
-                }
-                continue;
-            }
-            BigDecimal scaled = decimal(raw)
-                    .multiply(decimal(mapping.get("scale_factor")))
-                    .add(decimal(mapping.get("offset_value")));
-            points.put(pointCode, scaled);
-        }
-        return Map.of("success", errors.isEmpty(), "points", points, "errors", errors);
-    }
-
     private Map<String, Object> metrics(Long rootOrgId) {
         // The dashboard used to execute eleven independent aggregate queries here.
         // The database is remote in this deployment, so round-trip latency dominated
@@ -393,7 +365,7 @@ public class BusinessWorkspaceService {
         checks.add(check("网关档案", countScoped("dev_gateway", "org_id") > 0, "至少维护一个启用网关，并让 gateway_sn 与模拟网关一致"));
         checks.add(check("设备档案", countScoped("dev_device", "org_id") > 0, "至少维护一个设备，并绑定网关、组织、设备类型"));
         checks.add(check("测点定义", count("dev_point_definition") > 0, "设备类型需要配置可展示、可统计、可计费的测点"));
-        checks.add(check("测点映射", count("dev_point_mapping") > 0, "数据服务依赖映射把原始字段转换成标准 point_code"));
+        checks.add(check("协议绑定", count("dev_model_point_binding") > 0, "产品测点需要绑定已发布厂商协议字段"));
         checks.add(check("计费规则", count("billing_rule") > 0 && count("billing_price_item") > 0, "账单生成需要账号、规则、范围和价格"));
         checks.add(check("告警规则", count("alarm_rule") > 0, "告警规则启用后 data 服务才能生成告警事实"));
         return checks;
