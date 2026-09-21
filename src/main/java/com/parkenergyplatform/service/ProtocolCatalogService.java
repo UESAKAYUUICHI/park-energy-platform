@@ -28,7 +28,20 @@ public class ProtocolCatalogService {
         return jdbc.queryForList("""
                 SELECT p.*,v.id AS current_version_id,v.version_name,v.status AS version_status,
                        (SELECT COUNT(*) FROM dev_protocol_field f WHERE f.protocol_version_id=v.id) AS field_count,
-                       (SELECT COUNT(*) FROM dev_device_model_version mv WHERE mv.protocol_profile_version_id=v.id) AS model_count
+                       (SELECT COUNT(DISTINCT ref.model_id)
+                        FROM (
+                          SELECT mv.model_id
+                          FROM dev_device_model_version mv
+                          JOIN dev_protocol_profile_version pv ON pv.id=mv.protocol_profile_version_id
+                          WHERE pv.profile_id=p.id
+                          UNION
+                          SELECT mv.model_id
+                          FROM dev_device_model_version mv
+                          JOIN dev_model_point_binding b ON b.model_version_id=mv.id
+                          JOIN dev_protocol_field f ON f.id=b.protocol_field_id
+                          JOIN dev_protocol_profile_version pv ON pv.id=f.protocol_version_id
+                          WHERE pv.profile_id=p.id
+                        ) ref) AS model_count
                 FROM dev_protocol_profile p
                 LEFT JOIN dev_protocol_profile_version v ON v.profile_id=p.id
                   AND v.version_no=(SELECT MAX(v2.version_no) FROM dev_protocol_profile_version v2 WHERE v2.profile_id=p.id)
@@ -282,7 +295,21 @@ public class ProtocolCatalogService {
 
     @Transactional
     public void delete(long profileId) {
-        Long used = jdbc.queryForObject("SELECT COUNT(*) FROM dev_device_model_version mv JOIN dev_protocol_profile_version v ON v.id=mv.protocol_profile_version_id WHERE v.profile_id=?", Long.class, profileId);
+        Long used = jdbc.queryForObject("""
+                SELECT COUNT(DISTINCT ref.model_version_id)
+                FROM (
+                  SELECT mv.id AS model_version_id
+                  FROM dev_device_model_version mv
+                  JOIN dev_protocol_profile_version v ON v.id=mv.protocol_profile_version_id
+                  WHERE v.profile_id=?
+                  UNION
+                  SELECT b.model_version_id
+                  FROM dev_model_point_binding b
+                  JOIN dev_protocol_field f ON f.id=b.protocol_field_id
+                  JOIN dev_protocol_profile_version v ON v.id=f.protocol_version_id
+                  WHERE v.profile_id=?
+                ) ref
+                """, Long.class, profileId, profileId);
         if (used != null && used > 0) throw new BusinessException("协议已被产品版本引用，不能删除");
         jdbc.update("DELETE FROM dev_protocol_profile WHERE id=?", profileId);
     }

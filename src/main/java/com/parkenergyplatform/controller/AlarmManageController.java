@@ -8,6 +8,7 @@ import com.parkenergyplatform.aop.OperationLog;
 import com.parkenergyplatform.common.ApiResponse;
 import com.parkenergyplatform.common.PageResult;
 import com.parkenergyplatform.service.AlarmService;
+import com.parkenergyplatform.service.AlarmProtocolService;
 import com.parkenergyplatform.service.AlarmRuleService;
 import com.parkenergyplatform.service.OperationsService;
 import com.parkenergyplatform.service.PlatformBusinessQueryService;
@@ -26,15 +27,59 @@ import org.springframework.web.bind.annotation.RestController;
 public class AlarmManageController {
     private final AlarmService alarmService;
     private final AlarmRuleService ruleService;
+    private final AlarmProtocolService protocolService;
     private final PlatformBusinessQueryService queryService;
     private final OperationsService operationsService;
 
     public AlarmManageController(AlarmService alarmService, AlarmRuleService ruleService,
+                                 AlarmProtocolService protocolService,
                                  PlatformBusinessQueryService queryService, OperationsService operationsService) {
         this.alarmService = alarmService;
         this.ruleService = ruleService;
+        this.protocolService = protocolService;
         this.queryService = queryService;
         this.operationsService = operationsService;
+    }
+
+    @GetMapping("/protocols")
+    @SaCheckPermission("alarm:rule:list")
+    public ApiResponse<List<Map<String, Object>>> protocols() {
+        return ApiResponse.success(protocolService.list());
+    }
+
+    @GetMapping("/protocols/{id}")
+    @SaCheckPermission("alarm:rule:list")
+    public ApiResponse<Map<String, Object>> protocol(@PathVariable long id) {
+        return ApiResponse.success(protocolService.detail(id));
+    }
+
+    @PostMapping("/protocols")
+    @SaCheckPermission("alarm:rule:add")
+    @OperationLog(module = "告警管理", operation = "新增告警协议")
+    public ApiResponse<Map<String, Object>> createProtocol(@RequestBody Map<String, Object> body) {
+        return ApiResponse.success(protocolService.save(null, body));
+    }
+
+    @PutMapping("/protocols/{id}")
+    @SaCheckPermission("alarm:rule:edit")
+    @OperationLog(module = "告警管理", operation = "修改告警协议")
+    public ApiResponse<Map<String, Object>> updateProtocol(@PathVariable long id, @RequestBody Map<String, Object> body) {
+        return ApiResponse.success(protocolService.save(id, body));
+    }
+
+    @DeleteMapping("/protocols/{id}")
+    @SaCheckPermission("alarm:rule:edit")
+    @OperationLog(module = "告警管理", operation = "删除告警协议")
+    public ApiResponse<Void> deleteProtocol(@PathVariable long id) {
+        protocolService.delete(id);
+        return ApiResponse.success(null);
+    }
+
+    @PostMapping("/protocols/{id}/publish")
+    @SaCheckPermission("alarm:rule:edit")
+    @OperationLog(module = "告警管理", operation = "发布告警协议")
+    public ApiResponse<Map<String, Object>> publishProtocol(@PathVariable long id) {
+        return ApiResponse.success(protocolService.publish(id));
     }
 
     @GetMapping("/rules")

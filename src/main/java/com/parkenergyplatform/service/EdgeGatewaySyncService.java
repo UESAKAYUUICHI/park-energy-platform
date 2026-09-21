@@ -21,10 +21,13 @@ import java.util.Set;
 public class EdgeGatewaySyncService {
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
+    private final AlarmProtocolService alarmProtocolService;
 
-    public EdgeGatewaySyncService(JdbcTemplate jdbcTemplate, ObjectMapper objectMapper) {
+    public EdgeGatewaySyncService(JdbcTemplate jdbcTemplate, ObjectMapper objectMapper,
+                                  AlarmProtocolService alarmProtocolService) {
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
+        this.alarmProtocolService = alarmProtocolService;
     }
 
     @Transactional
@@ -329,6 +332,16 @@ public class EdgeGatewaySyncService {
             rules.add(rule);
         }
         return Map.of("gatewayId", gatewayId, "rules", rules, "serverTime", System.currentTimeMillis());
+    }
+
+    public Map<String, Object> alarmProtocols(String gatewaySn, String gatewaySecret) {
+        Map<String, Object> gateway = authenticate(gatewaySn, gatewaySecret);
+        long gatewayId = ((Number) gateway.get("id")).longValue();
+        return Map.of(
+                "gatewayId", gatewayId,
+                "protocols", alarmProtocolService.protocolsForGateway(gatewayId),
+                "serverTime", System.currentTimeMillis()
+        );
     }
 
     private Map<String, Object> authenticate(String gatewaySn, String secret) {

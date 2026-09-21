@@ -985,8 +985,10 @@ public class PlatformBusinessQueryService {
         String from = """
                 FROM log_alarm e
                 LEFT JOIN dev_device d ON d.id = e.device_id
+                LEFT JOIN dev_gateway g ON g.id = e.source_gateway_id
                 LEFT JOIN dev_org o ON o.id = e.org_id
                 LEFT JOIN alarm_rule r ON r.id = e.rule_id
+                LEFT JOIN alarm_protocol_point pp ON pp.id = e.protocol_point_id
                 WHERE 1 = 1
                 """;
         StringBuilder where = new StringBuilder();
@@ -1001,7 +1003,7 @@ public class PlatformBusinessQueryService {
         }
         appendEquals(where, args, "e.alarm_type", params.get("alarmType"));
         appendEquals(where, args, "e.alarm_level", params.get("alarmLevel"));
-        appendKeyword(where, args, params.get("keyword"), "d.device_sn", "d.device_name", "e.point_code", "r.rule_name");
+        appendKeyword(where, args, params.get("keyword"), "d.device_sn", "d.device_name", "g.gateway_sn", "g.gateway_name", "e.point_code", "pp.point_name", "r.rule_name");
         appendDateRange(where, args, "e.alarm_time", params.get("startTime"), params.get("endTime"));
         where.append(scopeSql("e.org_id", args));
         int pageNum = parsePositive(params.get("pageNum"), 1);
@@ -1011,7 +1013,29 @@ public class PlatformBusinessQueryService {
         pageArgs.add(pageSize);
         pageArgs.add((pageNum - 1) * pageSize);
         List<Map<String, Object>> rows = jdbcTemplate.queryForList("""
-                SELECT e.*, d.device_sn, d.device_name, o.org_name, r.rule_name
+                SELECT e.*,
+                       COALESCE(d.device_sn, g.gateway_sn) AS device_sn,
+                       COALESCE(d.device_name, d.device_sn, g.gateway_name, g.gateway_sn) AS device_name,
+                       g.gateway_sn AS source_gateway_sn,
+                       g.gateway_name AS source_gateway_name,
+                       o.org_name,
+                       r.rule_name,
+                       COALESCE(pp.point_name, e.point_code,
+                         CASE
+                           WHEN e.source_event_id LIKE 'GATEWAY_OFFLINE:%' THEN '网关在线状态'
+                           WHEN e.alarm_value = 'POINT_MISSING' THEN '测点采集状态'
+                           WHEN e.alarm_value = 'DEVICE_OFFLINE' THEN '设备在线状态'
+                           ELSE NULL
+                         END
+                       ) AS point_name,
+                       COALESCE(e.point_code,
+                         CASE
+                           WHEN e.source_event_id LIKE 'GATEWAY_OFFLINE:%' THEN '网关在线状态'
+                           WHEN e.alarm_value = 'POINT_MISSING' THEN '测点采集状态'
+                           WHEN e.alarm_value = 'DEVICE_OFFLINE' THEN '设备在线状态'
+                           ELSE NULL
+                         END
+                       ) AS point_code
                 """ + from + where + " ORDER BY e.alarm_time DESC LIMIT ? OFFSET ?", pageArgs.toArray());
         return PageResult.of(rows, total == null ? 0 : total, pageNum, pageSize);
     }
