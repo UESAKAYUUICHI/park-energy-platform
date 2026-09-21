@@ -28,13 +28,36 @@ public class AlarmService {
     public Map<String, Object> detail(long alarmId) {
         accessService.assertAlarmAccess(alarmId);
         Map<String, Object> data = new LinkedHashMap<>(single("""
-                SELECT a.*, d.device_sn, d.device_name, d.gateway_id, o.org_name, r.rule_name,
+                SELECT a.*,
+                       COALESCE(d.device_sn, g.gateway_sn) AS device_sn,
+                       COALESCE(d.device_name, d.device_sn, g.gateway_name, g.gateway_sn) AS device_name,
+                       d.gateway_id,
+                       g.gateway_sn AS source_gateway_sn, g.gateway_name AS source_gateway_name,
+                       o.org_name, r.rule_name, pp.point_name AS protocol_point_name,
+                       COALESCE(pp.point_name, a.point_code,
+                         CASE
+                           WHEN a.source_event_id LIKE 'GATEWAY_OFFLINE:%' THEN '网关在线状态'
+                           WHEN a.alarm_value = 'POINT_MISSING' THEN '测点采集状态'
+                           WHEN a.alarm_value = 'DEVICE_OFFLINE' THEN '设备在线状态'
+                           ELSE NULL
+                         END
+                       ) AS point_name,
+                       COALESCE(a.point_code,
+                         CASE
+                           WHEN a.source_event_id LIKE 'GATEWAY_OFFLINE:%' THEN '网关在线状态'
+                           WHEN a.alarm_value = 'POINT_MISSING' THEN '测点采集状态'
+                           WHEN a.alarm_value = 'DEVICE_OFFLINE' THEN '设备在线状态'
+                           ELSE NULL
+                         END
+                       ) AS point_code,
                        r.recovery_hold_seconds, w.work_order_no, w.status AS work_order_status,
                        w.close_type AS work_order_close_type, w.assignee_name
                 FROM log_alarm a
                 LEFT JOIN dev_device d ON d.id=a.device_id
+                LEFT JOIN dev_gateway g ON g.id=a.source_gateway_id
                 LEFT JOIN dev_org o ON o.id=a.org_id
                 LEFT JOIN alarm_rule r ON r.id=a.rule_id
+                LEFT JOIN alarm_protocol_point pp ON pp.id=a.protocol_point_id
                 LEFT JOIN ops_work_order w ON w.id=a.work_order_id
                 WHERE a.id=?
                 """, alarmId));

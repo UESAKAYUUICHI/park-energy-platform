@@ -33,7 +33,6 @@ public class AlarmAutomationService {
         Integer locked = jdbcTemplate.queryForObject("SELECT GET_LOCK('park_alarm_automation',0)", Integer.class);
         if (locked == null || locked != 1) return;
         try {
-            createPendingWorkOrders();
             closeStableRecoveredEvents();
         } finally {
             jdbcTemplate.queryForObject("SELECT RELEASE_LOCK('park_alarm_automation')", Integer.class);

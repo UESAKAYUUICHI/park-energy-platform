@@ -46,4 +46,11 @@ public class EdgeGatewaySyncController {
             @RequestHeader("X-Gateway-Secret") String gatewaySecret) {
         return ApiResponse.success(service.alarmRules(gatewaySn, gatewaySecret));
     }
+
+    @GetMapping("/alarm-protocols")
+    public ApiResponse<Map<String, Object>> alarmProtocols(
+            @RequestHeader("X-Gateway-Sn") String gatewaySn,
+            @RequestHeader("X-Gateway-Secret") String gatewaySecret) {
+        return ApiResponse.success(service.alarmProtocols(gatewaySn, gatewaySecret));
+    }
 }

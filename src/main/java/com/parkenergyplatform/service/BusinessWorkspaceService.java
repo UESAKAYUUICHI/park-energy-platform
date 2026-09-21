@@ -389,11 +389,15 @@ public class BusinessWorkspaceService {
         where += scopeSql("e.org_id", args, rootOrgId);
         args.add(limit);
         return jdbcTemplate.queryForList("""
-                SELECT e.*, d.device_name, o.org_name, r.rule_name
+                SELECT e.*, d.device_sn, d.device_name, g.gateway_sn, g.gateway_name, o.org_name,
+                       r.rule_name, pp.point_name AS protocol_point_name,
+                       COALESCE(pp.point_name, e.point_code) AS point_name
                 FROM log_alarm e
                 LEFT JOIN dev_device d ON d.id = e.device_id
+                LEFT JOIN dev_gateway g ON g.id = e.source_gateway_id
                 LEFT JOIN dev_org o ON o.id = e.org_id
                 LEFT JOIN alarm_rule r ON r.id = e.rule_id
+                LEFT JOIN alarm_protocol_point pp ON pp.id = e.protocol_point_id
                 """ + where + "ORDER BY e.alarm_time DESC LIMIT ?", args.toArray());
     }
 
