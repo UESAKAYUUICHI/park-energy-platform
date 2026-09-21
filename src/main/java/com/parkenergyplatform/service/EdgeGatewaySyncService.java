@@ -130,12 +130,7 @@ public class EdgeGatewaySyncService {
             item.put("readBlocks", blocks);
             item.put("fields", fields);
             item.put("bindings", bindings);
-            item.put("commands", jdbcTemplate.queryForList("""
-                    SELECT command_code AS commandCode,command_name AS commandName,function_code AS functionCode,
-                           register_address AS registerAddress,encode_type AS encodeType,value_type AS valueType,
-                           fixed_value AS fixedValue,parameter_json AS parameterJson
-                    FROM dev_protocol_command WHERE protocol_version_id=? AND enabled=1 ORDER BY sort,id
-                    """, model.get("protocolVersionId")));
+            item.put("commands", protocolCommands(model.get("protocolVersionId")));
             models.add(item);
         }
         normalizeAndValidateDevices(devices, channels);
@@ -157,6 +152,35 @@ public class EdgeGatewaySyncService {
         result.put("devices", devices);
         result.put("models", models);
         return result;
+    }
+
+    private List<Map<String, Object>> protocolCommands(Object protocolVersionId) {
+        List<Map<String, Object>> commands = jdbcTemplate.queryForList("""
+                SELECT command_code AS commandCode,command_name AS commandName,function_code AS functionCode,
+                       register_address AS registerAddress,encode_type AS encodeType,value_type AS valueType,
+                       fixed_value AS fixedValue,parameter_json AS parameterJson
+                FROM dev_protocol_command WHERE protocol_version_id=? AND enabled=1 ORDER BY sort,id
+                """, protocolVersionId);
+        if (!commands.isEmpty()) {
+            return commands;
+        }
+        return jdbcTemplate.queryForList("""
+                SELECT c.command_code AS commandCode,c.command_name AS commandName,c.function_code AS functionCode,
+                       c.register_address AS registerAddress,c.encode_type AS encodeType,c.value_type AS valueType,
+                       c.fixed_value AS fixedValue,c.parameter_json AS parameterJson
+                FROM dev_protocol_command c
+                WHERE c.enabled=1 AND c.protocol_version_id=(
+                    SELECT pv.id
+                    FROM dev_protocol_profile_version pv
+                    JOIN dev_protocol_command pc ON pc.protocol_version_id=pv.id AND pc.enabled=1
+                    WHERE pv.profile_id=(SELECT profile_id FROM dev_protocol_profile_version WHERE id=?)
+                      AND pv.status='PUBLISHED'
+                    GROUP BY pv.id,pv.version_no
+                    ORDER BY pv.version_no DESC,pv.id DESC
+                    LIMIT 1
+                )
+                ORDER BY c.sort,c.id
+                """, protocolVersionId);
     }
 
     private void normalizeAndValidateDevices(List<Map<String, Object>> devices, List<Map<String, Object>> channels) {
