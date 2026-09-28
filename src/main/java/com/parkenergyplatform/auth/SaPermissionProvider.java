@@ -1,9 +1,9 @@
 package com.parkenergyplatform.auth;
+import com.parkenergyplatform.service.system.RbacService;
 
 import java.util.List;
 
 import cn.dev33.satoken.stp.StpInterface;
-import com.parkenergyplatform.service.RbacService;
 import org.springframework.stereotype.Component;
 
 @Component
