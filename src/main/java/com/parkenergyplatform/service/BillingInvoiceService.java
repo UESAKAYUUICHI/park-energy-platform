@@ -2,12 +2,6 @@ package com.parkenergyplatform.service;
 
 import com.parkenergyplatform.common.BusinessException;
 import com.parkenergyplatform.common.PageResult;
-import com.parkenergyplatform.config.ParkCosProperties;
-import com.qcloud.cos.COSClient;
-import com.qcloud.cos.http.HttpMethodName;
-import com.qcloud.cos.model.ObjectMetadata;
-import com.qcloud.cos.model.PutObjectRequest;
-import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -18,7 +12,6 @@ import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -30,12 +23,11 @@ public class BillingInvoiceService {
     private final JdbcTemplate jdbc;
     private final BusinessDataAccessService access;
     private final BillingPeriodGuardService periodGuard;
-    private final ObjectProvider<COSClient> cosProvider;
-    private final ParkCosProperties cosProperties;
+    private final ObjectStorageService objectStorage;
 
     public BillingInvoiceService(JdbcTemplate jdbc, BusinessDataAccessService access, BillingPeriodGuardService periodGuard,
-                                 ObjectProvider<COSClient> cosProvider, ParkCosProperties cosProperties) {
-        this.jdbc=jdbc;this.access=access;this.periodGuard=periodGuard;this.cosProvider=cosProvider;this.cosProperties=cosProperties;
+                                 ObjectStorageService objectStorage) {
+        this.jdbc=jdbc;this.access=access;this.periodGuard=periodGuard;this.objectStorage=objectStorage;
     }
 
     public PageResult<Map<String,Object>> page(Map<String,String> params) {
@@ -104,8 +96,8 @@ public class BillingInvoiceService {
         if(!List.of("ISSUED","DELIVERED").contains(String.valueOf(invoice.get("invoice_status"))))throw new BusinessException("请先开具发票再上传电子票文件");
         if(file==null||file.isEmpty())throw new BusinessException("电子发票文件不能为空");if(file.getSize()>5L*1024*1024)throw new BusinessException("电子发票文件不能超过5MB");
         String filename=textOr(file.getOriginalFilename(),"invoice.pdf"),lower=filename.toLowerCase();if(!lower.endsWith(".pdf")&&!lower.endsWith(".ofd"))throw new BusinessException("仅支持 PDF 或 OFD 电子发票");
-        String key="billing-invoices/"+id+"/"+UUID.randomUUID().toString().replace("-","")+ (lower.endsWith(".ofd")?".ofd":".pdf");ObjectMetadata metadata=new ObjectMetadata();metadata.setContentLength(file.getSize());metadata.setContentType(textOr(file.getContentType(),lower.endsWith(".ofd")?"application/ofd":"application/pdf"));
-        try{cos().putObject(new PutObjectRequest(cosProperties.bucket(),key,file.getInputStream(),metadata));}catch(Exception exception){throw new BusinessException("电子发票上传失败："+exception.getMessage());}
+        String key="billing-invoices/"+id+"/"+UUID.randomUUID().toString().replace("-","")+ (lower.endsWith(".ofd")?".ofd":".pdf");
+        try{objectStorage.put(key, file.getInputStream(), file.getSize(), textOr(file.getContentType(),lower.endsWith(".ofd")?"application/ofd":"application/pdf"));}catch(Exception exception){throw new BusinessException("电子发票上传失败："+exception.getMessage());}
         jdbc.update("UPDATE billing_invoice SET file_name=?,file_url=?,updated_by=? WHERE id=?",filename,key,operator,id);return detail(id);
     }
 
@@ -123,8 +115,7 @@ public class BillingInvoiceService {
 
     private void assertMutableBills(long invoiceId){List<Long> ids=jdbc.queryForList("SELECT bill_id FROM billing_invoice_bill WHERE invoice_id=?",Long.class,invoiceId);for(Long billId:ids)periodGuard.assertBillWritable(billId);}
     private Map<String,Object> requiredInvoice(long id,boolean lock){List<Map<String,Object>> rows=jdbc.queryForList("SELECT * FROM billing_invoice WHERE id=?"+(lock?" FOR UPDATE":""),id);if(rows.isEmpty())throw new BusinessException(404,"发票记录不存在");Map<String,Object> row=rows.get(0);assertOrg(number(row.get("org_id"),"orgId"));return row;}
-    private COSClient cos(){COSClient value=cosProvider.getIfAvailable();if(value==null)throw new BusinessException("COS未启用，无法上传电子发票");return value;}
-    private String signedUrl(String key){try{Date expiration=new Date(System.currentTimeMillis()+Math.max(60,cosProperties.urlExpireSeconds())*1000);return cos().generatePresignedUrl(cosProperties.bucket(),key,expiration, HttpMethodName.GET).toString();}catch(RuntimeException exception){return null;}}
+    private String signedUrl(String key){return objectStorage.previewUrlOrNull(key);}
     private List<Long> ids(Object value){if(!(value instanceof List<?> list))return List.of();List<Long> ids=new ArrayList<>();for(Object item:list){try{long id=Long.parseLong(String.valueOf(item));if(!ids.contains(id))ids.add(id);}catch(Exception ignored){}}return ids;}
     private void assertOrg(long id){if(!access.hasOrgAccess(id))throw new BusinessException(403,"没有该园区发票权限");}
     private long number(Object value,String name){try{return Long.parseLong(String.valueOf(value));}catch(Exception exception){throw new BusinessException(name+"必须为数字");}}

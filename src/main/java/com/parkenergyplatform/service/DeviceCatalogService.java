@@ -2,7 +2,6 @@ package com.parkenergyplatform.service;
 
 import java.sql.PreparedStatement;
 import java.sql.Statement;
-import java.net.URL;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -23,16 +22,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.parkenergyplatform.common.BusinessException;
 import com.parkenergyplatform.config.ParkCosProperties;
-import com.qcloud.cos.COSClient;
-import com.qcloud.cos.model.DeleteObjectRequest;
 import com.qcloud.cos.http.HttpMethodName;
-import com.qcloud.cos.model.GeneratePresignedUrlRequest;
-import com.qcloud.cos.model.ObjectMetadata;
-import com.qcloud.cos.model.PutObjectRequest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
-import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -49,14 +42,14 @@ public class DeviceCatalogService {
 
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
-    private final ObjectProvider<COSClient> cosClientProvider;
+    private final ObjectStorageService objectStorage;
     private final ParkCosProperties cosProperties;
 
     public DeviceCatalogService(JdbcTemplate jdbcTemplate, ObjectMapper objectMapper,
-                                ObjectProvider<COSClient> cosClientProvider, ParkCosProperties cosProperties) {
+                                ObjectStorageService objectStorage, ParkCosProperties cosProperties) {
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
-        this.cosClientProvider = cosClientProvider;
+        this.objectStorage = objectStorage;
         this.cosProperties = cosProperties;
     }
 
@@ -683,17 +676,14 @@ public class DeviceCatalogService {
         if (size > 5L * 1024 * 1024) throw new BusinessException("图片不能超过 5MB");
         String ext = imageExtension(fileName, contentType);
         String objectKey = normalizedObjectPrefix() + modelId + "/" + UUID.randomUUID().toString().replace("-", "") + "." + ext;
-        java.util.Date expiration = java.util.Date.from(Instant.now().plusSeconds(Math.max(60L, cosProperties.urlExpireSeconds())));
-        GeneratePresignedUrlRequest request = new GeneratePresignedUrlRequest(cosProperties.bucket(), objectKey, HttpMethodName.PUT);
-        request.setExpiration(expiration);
-        URL uploadUrl = cosClient().generatePresignedUrl(request);
+        java.net.URL uploadUrl = objectStorage.presignedUrl(objectKey, HttpMethodName.PUT);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("model", model);
         result.put("objectKey", objectKey);
         result.put("uploadUrl", uploadUrl.toString());
         result.put("previewUrl", modelImagePreviewUrl(objectKey));
         result.put("contentType", contentType);
-        result.put("expiresAt", expiration.toInstant().toString());
+        result.put("expiresAt", java.time.Instant.now().plusSeconds(Math.max(60L, cosProperties.urlExpireSeconds())).toString());
         result.put("maxSizeBytes", 5L * 1024 * 1024);
         return result;
     }
@@ -707,11 +697,8 @@ public class DeviceCatalogService {
         Map<String, Object> current = single("SELECT image_object_key FROM dev_device_model WHERE id=?", modelId);
         String objectKey = normalizedObjectPrefix() + modelId + "/" + UUID.randomUUID().toString().replace("-", "")
                 + "." + imageExtension(textOr(file.getOriginalFilename(), "model-image"), contentType);
-        ObjectMetadata metadata = new ObjectMetadata();
-        metadata.setContentLength(file.getSize());
-        metadata.setContentType(contentType);
         try {
-            cosClient().putObject(new PutObjectRequest(cosProperties.bucket(), objectKey, file.getInputStream(), metadata));
+            objectStorage.put(objectKey, file.getInputStream(), file.getSize(), contentType);
         } catch (IOException exception) {
             throw new BusinessException("读取图片文件失败");
         } catch (RuntimeException exception) {
@@ -1353,15 +1340,8 @@ public class DeviceCatalogService {
         return code.length() > 64 ? code.substring(0, 64) : code;
     }
 
-    private COSClient cosClient() {
-        COSClient client = cosClientProvider.getIfAvailable();
-        if (client == null) throw new BusinessException("COS 未启用，请先配置 park.cos.enabled=true 和密钥");
-        return client;
-    }
-
     private String normalizedObjectPrefix() {
-        String prefix = textOr(cosProperties.objectPrefix(), "device-models/");
-        return prefix.endsWith("/") ? prefix : prefix + "/";
+        return objectStorage.objectPrefix();
     }
 
     private String imageExtension(String fileName, String contentType) {
@@ -1382,21 +1362,15 @@ public class DeviceCatalogService {
     private String modelImagePreviewUrl(String objectKey) {
         if (!StringUtils.hasText(objectKey)) return null;
         try {
-            java.util.Date expiration = java.util.Date.from(Instant.now().plusSeconds(Math.max(60L, cosProperties.urlExpireSeconds())));
-            GeneratePresignedUrlRequest request = new GeneratePresignedUrlRequest(cosProperties.bucket(), objectKey, HttpMethodName.GET);
-            request.setExpiration(expiration);
-            return cosClient().generatePresignedUrl(request).toString();
-        } catch (RuntimeException exception) {
-            return null;
-        }
+            return objectStorage.previewUrlOrNull(objectKey);
+        } catch (RuntimeException exception) { return null; }
     }
 
     private void deleteObjectQuietly(String objectKey) {
         if (!StringUtils.hasText(objectKey)) return;
         try {
-            cosClient().deleteObject(new DeleteObjectRequest(cosProperties.bucket(), objectKey));
-        } catch (RuntimeException ignored) {
-        }
+            objectStorage.deleteQuietly(objectKey);
+        } catch (RuntimeException ignored) { }
     }
 
     private void requireText(Object value, String message) {
