@@ -53,10 +53,32 @@ public class EnergyEfficiencyService {
         response.put("dataCompleteRate", scale(decimal(usage.get("completeness")), 2));
         response.put("tou", tou);
         response.put("quality", quality);
+        response.put("hourlySeries", hourlySeries(filter));
         response.put("comparison", comparison);
         response.put("baseline", baseline);
         response.put("judgements", judgements(quality, baseline));
         return response;
+    }
+
+    private List<Map<String, Object>> hourlySeries(Filter filter) {
+        return jdbcTemplate.queryForList("""
+                SELECT CONCAT(s.stat_date, ' ', LPAD(s.stat_hour, 2, '0'), ':00') time,
+                       AVG(CASE WHEN s.point_code='VOLTAGE_A' THEN s.avg_value END) voltage_a,
+                       AVG(CASE WHEN s.point_code='VOLTAGE_B' THEN s.avg_value END) voltage_b,
+                       AVG(CASE WHEN s.point_code='VOLTAGE_C' THEN s.avg_value END) voltage_c,
+                       AVG(CASE WHEN s.point_code='CURRENT_A' THEN s.avg_value END) current_a,
+                       AVG(CASE WHEN s.point_code='CURRENT_B' THEN s.avg_value END) current_b,
+                       AVG(CASE WHEN s.point_code='CURRENT_C' THEN s.avg_value END) current_c,
+                       AVG(CASE WHEN s.point_code='FREQUENCY' THEN s.avg_value END) frequency,
+                       AVG(CASE WHEN s.point_code='ACTIVE_POWER_TOTAL' THEN s.avg_value END) active_power,
+                       AVG(CASE WHEN s.point_code='REACTIVE_POWER_TOTAL' THEN s.avg_value END) reactive_power,
+                       AVG(CASE WHEN s.point_code='APPARENT_POWER_TOTAL' THEN s.avg_value END) apparent_power,
+                       AVG(CASE WHEN s.point_code='POWER_FACTOR_TOTAL' THEN s.avg_value END) power_factor
+                FROM stats_hourly_point s JOIN dev_device d ON d.id=s.device_id
+                WHERE s.point_code IN ('VOLTAGE_A','VOLTAGE_B','VOLTAGE_C','CURRENT_A','CURRENT_B','CURRENT_C',
+                  'FREQUENCY','ACTIVE_POWER_TOTAL','REACTIVE_POWER_TOTAL','APPARENT_POWER_TOTAL','POWER_FACTOR_TOTAL') %s
+                GROUP BY s.stat_date, s.stat_hour ORDER BY s.stat_date, s.stat_hour LIMIT 1000
+                """.formatted(filter.sql()), filter.args().toArray());
     }
 
     private Map<String, Object> tou(Filter filter) {
