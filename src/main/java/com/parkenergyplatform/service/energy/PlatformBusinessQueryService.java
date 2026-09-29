@@ -332,10 +332,38 @@ public class PlatformBusinessQueryService {
         List<Object> contractArgs = new ArrayList<>();
         String contractScope = accessService.orgFilterSql("c.org_id", orgId, true, contractArgs);
         profile.put("activeContractCount", queryLong("SELECT COUNT(*) FROM leasing_contract c WHERE c.status = 'ACTIVE'" + contractScope, contractArgs));
+        profile.put("activeContracts", jdbcTemplate.queryForList("""
+                SELECT c.id AS contract_id, c.contract_name,
+                       c.tenant_id, t.tenant_name
+                FROM leasing_contract c
+                LEFT JOIN crm_tenant t ON t.id = c.tenant_id
+                WHERE c.status = 'ACTIVE'
+                """ + contractScope + " ORDER BY c.contract_name, c.id LIMIT 30", contractArgs.toArray()));
         List<Object> tenantArgs = new ArrayList<>();
         String tenantScope = accessService.orgFilterSql("c.org_id", orgId, true, tenantArgs);
         profile.put("tenantCount", queryLong("SELECT COUNT(DISTINCT c.tenant_id) FROM leasing_contract c WHERE c.status = 'ACTIVE'" + tenantScope, tenantArgs));
         profile.put("spaces", jdbcTemplate.queryForList("SELECT * FROM park_space WHERE 1 = 1" + spaceScope + " ORDER BY space_type, space_code LIMIT 30", spaceArgs.toArray()));
+        profile.put("activeTenants", jdbcTemplate.queryForList("""
+                SELECT t.id AS tenant_id, t.tenant_name, t.contact_name,
+                       MAX(c.contract_name) AS contract_name
+                FROM leasing_contract c
+                LEFT JOIN crm_tenant t ON t.id = c.tenant_id
+                WHERE c.status = 'ACTIVE'
+                """ + contractScope + " GROUP BY t.id, t.tenant_name, t.contact_name ORDER BY t.tenant_name, t.id LIMIT 30", contractArgs.toArray()));
+        List<Object> gatewayArgs = new ArrayList<>();
+        String gatewayScope = accessService.orgFilterSql("org_id", orgId, true, gatewayArgs);
+        profile.put("gateways", jdbcTemplate.queryForList("""
+                SELECT id, gateway_name, gateway_sn, online_status, install_location
+                FROM dev_gateway
+                WHERE 1 = 1
+                """ + gatewayScope + " ORDER BY gateway_name, id LIMIT 30", gatewayArgs.toArray()));
+        List<Object> deviceArgs = new ArrayList<>();
+        String deviceScope = accessService.orgFilterSql("org_id", orgId, true, deviceArgs);
+        profile.put("devices", jdbcTemplate.queryForList("""
+                SELECT id, device_name, device_sn, online_status, install_location
+                FROM dev_device
+                WHERE 1 = 1
+                """ + deviceScope + " ORDER BY device_name, id LIMIT 50", deviceArgs.toArray()));
         List<Object> onlineGatewayArgs = new ArrayList<>();
         String onlineGatewayScope = accessService.orgFilterSql("org_id", orgId, true, onlineGatewayArgs);
         profile.put("onlineGatewayCount", queryLong("""
@@ -343,14 +371,69 @@ public class PlatformBusinessQueryService {
                 FROM dev_gateway
                 WHERE online_status = 1
                 """ + onlineGatewayScope, onlineGatewayArgs));
+        List<Object> topologyGatewayArgs = new ArrayList<>();
+        String topologyGatewayScope = accessService.orgFilterSql("g.org_id", orgId, true, topologyGatewayArgs);
+        List<Map<String, Object>> topologyGateways = jdbcTemplate.queryForList("""
+                SELECT g.id, g.gateway_sn, g.gateway_name, g.org_id, g.install_location,
+                       g.online_status, g.last_online_time, g.firmware_version, g.status
+                FROM dev_gateway g
+                WHERE 1 = 1
+                """ + topologyGatewayScope + " ORDER BY g.gateway_name, g.id", topologyGatewayArgs.toArray());
+        List<Object> topologyDeviceArgs = new ArrayList<>();
+        String topologyDeviceScope = accessService.orgFilterSql("d.org_id", orgId, true, topologyDeviceArgs);
+        List<Map<String, Object>> topologyDevices = jdbcTemplate.queryForList("""
+                SELECT d.id, d.device_sn, d.device_name, d.gateway_id, d.org_id, d.online_status,
+                       d.last_online_time, d.status, t.type_name, m.image_object_key
+                FROM dev_device d
+                LEFT JOIN dev_device_type t ON t.id = d.device_type_id
+                LEFT JOIN dev_device_model_version v ON v.id = d.model_version_id
+                LEFT JOIN dev_device_model m ON m.id = v.model_id
+                WHERE 1 = 1
+                """ + topologyDeviceScope + " ORDER BY d.device_name, d.id", topologyDeviceArgs.toArray());
+        topologyDevices.forEach(device -> device.put("model_image_url",
+                deviceCatalogService.modelImageUrl(Objects.toString(device.get("image_object_key"), ""))));
+        List<Map<String, Object>> assetTopology = new ArrayList<>();
+        for (Map<String, Object> gateway : topologyGateways) {
+            Map<String, Object> node = new LinkedHashMap<>(gateway);
+            Long gatewayId = longOrNull(gateway.get("id"));
+            node.put("devices", topologyDevices.stream()
+                    .filter(device -> Objects.equals(gatewayId, longOrNull(device.get("gateway_id"))))
+                    .toList());
+            assetTopology.add(node);
+        }
+        List<Map<String, Object>> unboundDevices = topologyDevices.stream()
+                .filter(device -> longOrNull(device.get("gateway_id")) == null)
+                .toList();
+        if (!unboundDevices.isEmpty()) {
+            Map<String, Object> unbound = new LinkedHashMap<>();
+            unbound.put("id", "UNBOUND");
+            unbound.put("gateway_name", "未绑定网关");
+            unbound.put("online_status", 0);
+            unbound.put("virtual", true);
+            unbound.put("devices", unboundDevices);
+            assetTopology.add(unbound);
+        }
+        profile.put("assetTopology", assetTopology);
         List<Map<String, Object>> recentAlarms = orgAlarms(orgId);
         List<Map<String, Object>> alarmTrend = orgAlarmTrend(orgId);
         List<Map<String, Object>> energyTrend = energyTrend(Map.of("orgId", String.valueOf(orgId)));
         List<Map<String, Object>> realtimeSnapshots = realtimeSnapshots(Map.of("orgId", String.valueOf(orgId)));
+        List<Map<String, Object>> inspectionRecords = jdbcTemplate.queryForList("""
+                SELECT c.id, c.command_id, c.gateway_id, c.target_type, c.target_id, c.target_sn,
+                       c.command_type, c.status, c.request_time, c.send_time, c.response_time,
+                       c.fail_reason, c.create_time, g.gateway_name, d.device_name, d.device_sn
+                FROM command_record c
+                LEFT JOIN dev_gateway g ON g.id = c.gateway_id
+                LEFT JOIN dev_device d ON c.target_type = 'DEVICE' AND d.id = c.target_id
+                WHERE (g.org_id = ? OR d.org_id = ?)
+                ORDER BY c.request_time DESC
+                LIMIT 20
+                """, orgId, orgId);
         profile.put("recentAlarms", recentAlarms);
         profile.put("alarmTrend", alarmTrend);
         profile.put("energyTrend", energyTrend);
         profile.put("realtimeSnapshots", realtimeSnapshots);
+        profile.put("inspectionRecords", inspectionRecords);
         profile.put("summary", Map.of(
                 "deviceCount", profile.get("deviceCount"),
                 "gatewayCount", profile.get("gatewayCount"),
@@ -378,6 +461,24 @@ public class PlatformBusinessQueryService {
         profile.put("gateway", gateway);
         profile.put("deviceCount", queryLong("SELECT COUNT(*) FROM dev_device WHERE gateway_id = ?", List.of(gatewayId)));
         profile.put("onlineDeviceCount", queryLong("SELECT COUNT(*) FROM dev_device WHERE gateway_id = ? AND status = 1 AND online_status = 1", List.of(gatewayId)));
+        profile.put("devices", jdbcTemplate.queryForList("""
+                SELECT d.id AS device_id, d.device_sn, d.device_name, d.status, d.online_status,
+                       d.protocol_addr, d.install_location, d.device_model, d.collect_interval_seconds,
+                       d.meter_role, d.energy_carrier, t.type_name
+                FROM dev_device d
+                LEFT JOIN dev_device_type t ON t.id = d.device_type_id
+                WHERE d.gateway_id = ?
+                ORDER BY d.device_name, d.id
+                """, gatewayId));
+        profile.put("inspectionRecords", jdbcTemplate.queryForList("""
+                SELECT c.id, c.command_id, c.gateway_id, c.target_type, c.target_id, c.target_sn,
+                       c.command_type, c.status, c.request_time, c.send_time, c.response_time,
+                       c.fail_reason, c.create_time
+                FROM command_record c
+                WHERE c.gateway_id = ?
+                ORDER BY c.request_time DESC
+                LIMIT 20
+                """, gatewayId));
         List<Map<String, Object>> recentAlarms = gatewayAlarms(gatewayId);
         List<Map<String, Object>> alarmTrend = gatewayAlarmTrend(gatewayId);
         List<Map<String, Object>> energyTrend = gatewayEnergyTrend(gatewayId);
@@ -461,9 +562,13 @@ public class PlatformBusinessQueryService {
 
     private List<Map<String, Object>> gatewayAlarms(long gatewayId) {
         return jdbcTemplate.queryForList("""
-                SELECT e.*, d.device_sn, d.device_name
+                SELECT e.*, d.device_sn, d.device_name,
+                       w.work_order_no, w.status AS work_order_status,
+                       w.priority AS work_order_priority, w.assignee_name AS work_order_assignee,
+                       w.title AS work_order_title
                 FROM log_alarm e
                 JOIN dev_device d ON d.id = e.device_id
+                LEFT JOIN ops_work_order w ON w.id = e.work_order_id
                 WHERE d.gateway_id = ?
                 ORDER BY e.alarm_time DESC
                 LIMIT 10

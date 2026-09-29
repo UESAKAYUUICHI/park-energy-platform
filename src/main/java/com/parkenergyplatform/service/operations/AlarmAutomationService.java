@@ -48,6 +48,8 @@ public class AlarmAutomationService {
                   AND a.event_status IN ('NEW','ACKNOWLEDGED')
                   AND NOT EXISTS (SELECT 1 FROM ops_work_order w WHERE w.source_type='ALARM' AND w.source_id=a.id
                                   AND w.status NOT IN ('CLOSED','CANCELLED'))
+                  AND NOT EXISTS (SELECT 1 FROM ops_work_order cancelled WHERE cancelled.source_type='ALARM'
+                                  AND cancelled.source_id=a.id AND cancelled.status='CANCELLED')
                 ORDER BY a.alarm_level DESC,a.first_occurrence_time
                 LIMIT 100
                 """, Long.class);

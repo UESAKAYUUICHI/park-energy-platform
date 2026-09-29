@@ -133,7 +133,7 @@ public class OperationsController {
         return switch (action == null ? "" : action.toUpperCase()) {
             case "ASSIGN" -> "ops:workorder:assign";
             case "ACCEPT" -> "ops:workorder:accept";
-            case "ARRIVE", "COMPLETE" -> "ops:workorder:execute";
+            case "START", "ARRIVE", "COMPLETE" -> "ops:workorder:execute";
             case "VERIFY" -> "ops:workorder:verify";
             case "CANCEL" -> "ops:workorder:cancel";
             default -> "ops:workorder:operate";

@@ -42,7 +42,10 @@ public class OperationsService {
     public PageResult<Map<String, Object>> workOrders(Map<String, String> params) {
         List<Object> args = new ArrayList<>();
         StringBuilder where = new StringBuilder(" WHERE 1 = 1");
-        equals(where, args, "w.status", params.get("status"));
+        String statusGroup = text(params.get("statusGroup"));
+        if ("TODO".equalsIgnoreCase(statusGroup)) where.append(" AND w.status IN ('PENDING','ASSIGNED')");
+        else if ("PROCESSING".equalsIgnoreCase(statusGroup)) where.append(" AND w.status IN ('ACCEPTED','PROCESSING')");
+        else equals(where, args, "w.status", params.get("status"));
         equals(where, args, "w.priority", params.get("priority"));
         equals(where, args, "w.assignee_user_id", params.get("assigneeUserId"));
         equals(where, args, "w.device_id", params.get("deviceId"));
@@ -255,7 +258,7 @@ public class OperationsService {
         return userRequest ? workOrder(number(order.get("id"))) : order;
     }
 
-    /** Closes a recovered incident and any linked work order after the stable recovery window. */
+    /** Records stable recovery on active work orders; only unassigned incidents auto-close. */
     @Transactional
     public boolean autoCloseRecoveredAlarm(long alarmId, int recoveryHoldSeconds) {
         Map<String, Object> alarm = single("SELECT * FROM log_alarm WHERE id=? FOR UPDATE", alarmId);
@@ -271,19 +274,19 @@ public class OperationsService {
                 FOR UPDATE
                 """, alarmId);
         for (Map<String, Object> order : orders) {
+            if ("RECOVERED".equalsIgnoreCase(textOr(order.get("device_state"), ""))) continue;
             String from = textOr(order.get("status"), "PENDING");
             jdbcTemplate.update("""
-                    UPDATE ops_work_order SET status='CLOSED', active_source_key=NULL, close_type='AUTO_RECOVERY', update_by='system',
-                        completed_time=COALESCE(completed_time,NOW()), verified_time=NOW(), closed_time=NOW(),
-                        verify_remark=CONCAT(COALESCE(verify_remark,''), ?)
+                    UPDATE ops_work_order SET device_state='RECOVERED', device_state_time=NOW(), update_by='system',
+                        verify_remark=CONCAT(COALESCE(verify_remark,''), ?), workflow_version=workflow_version+1
                     WHERE id=?
-                    """, " [系统自动闭环] 设备数据连续恢复正常 " + recoveryHoldSeconds + " 秒", order.get("id"));
-            log(number(order.get("id")), "AUTO_RECOVERY_CLOSE", from, "CLOSED", system,
-                    "告警恢复观察期结束，系统自动关闭工单");
-            notify(number(order.get("org_id")), nullableLong(order.get("assignee_user_id")), "AUTO_CLOSED",
-                    number(order.get("id")), "工单已自动关闭", order.get("work_order_no") + " 对应设备数据已恢复");
-            energySavingVerificationService.verifyOnClosure(order, "system");
+                    """, " [设备状态] 已连续恢复正常 " + recoveryHoldSeconds + " 秒", order.get("id"));
+            log(number(order.get("id")), "DEVICE_RECOVERED", from, from, system,
+                    "设备数据恢复正常，工单保留人工验收权");
+            notify(number(order.get("org_id")), nullableLong(order.get("assignee_user_id")), "DEVICE_RECOVERED",
+                    number(order.get("id")), "设备状态已恢复", order.get("work_order_no") + " 已满足验收条件，请核验后关闭");
         }
+        if (!orders.isEmpty()) return true;
         int updated = jdbcTemplate.update("""
                 UPDATE log_alarm SET event_status='CLOSED', active_fingerprint=NULL, deal_status=1,
                     deal_time=NOW(), deal_user='system', deal_remark=?, close_time=NOW(), close_user_id=NULL,
@@ -302,8 +305,19 @@ public class OperationsService {
 
     @Transactional
     public Map<String, Object> operate(long id, String action, Map<String, Object> body) {
+        // Recovery automation locks alarm then work order. Keep the same lock
+        // order here so concurrent device recovery and manual actions cannot deadlock.
+        Map<String, Object> snapshot = requiredWorkOrder(id, false);
+        if ("ALARM".equalsIgnoreCase(textOr(snapshot.get("source_type"), "")) && snapshot.get("source_id") != null) {
+            jdbcTemplate.queryForList("SELECT id FROM log_alarm WHERE id=? FOR UPDATE", snapshot.get("source_id"));
+        }
         Map<String, Object> order = requiredWorkOrder(id, true);
         String status = textOr(order.get("status"), "PENDING");
+        Long expectedVersion = nullableLong(body.get("workflowVersion"));
+        long currentVersion = number(order.get("workflow_version"));
+        if (expectedVersion != null && expectedVersion != currentVersion) {
+            throw new BusinessException("工单已被其他操作更新，请刷新后再提交");
+        }
         Actor actor = actor();
         String normalized = requiredText(action, "action").toUpperCase();
         switch (normalized) {
@@ -312,7 +326,7 @@ public class OperationsService {
                 Long assigneeId = requiredLong(body.get("assigneeUserId"), "assigneeUserId");
                 Map<String, Object> assignee = assigneeForOrg(number(order.get("org_id")), assigneeId);
                 String assigneeName = textOr(assignee.get("nickname"), textOr(assignee.get("username"), String.valueOf(assigneeId)));
-                jdbcTemplate.update("UPDATE ops_work_order SET status='ASSIGNED', assignee_user_id=?, assignee_name=?, assign_time=NOW(), sla_due_time=COALESCE(?, sla_due_time), update_by=? WHERE id=?",
+                jdbcTemplate.update("UPDATE ops_work_order SET status='ASSIGNED', assignee_user_id=?, assignee_name=?, assign_time=NOW(), sla_due_time=COALESCE(?, sla_due_time), update_by=?, workflow_version=workflow_version+1 WHERE id=?",
                         assigneeId, assigneeName, nullableTimestamp(body.get("slaDueTime")), actor.name(), id);
                 log(id, "ASSIGN", status, "ASSIGNED", actor, text(body.get("remark")));
                 notify(number(order.get("org_id")), assigneeId, "WORK_ORDER_ASSIGNED", id,
@@ -321,19 +335,27 @@ public class OperationsService {
             case "ACCEPT" -> {
                 requireStatus(status, "ASSIGNED");
                 assertAssignee(order, actor, "工单");
-                jdbcTemplate.update("UPDATE ops_work_order SET status='ACCEPTED', accepted_time=NOW(), update_by=? WHERE id=?", actor.name(), id);
+                jdbcTemplate.update("UPDATE ops_work_order SET status='ACCEPTED', accepted_time=NOW(), update_by=?, workflow_version=workflow_version+1 WHERE id=?", actor.name(), id);
                 log(id, "ACCEPT", status, "ACCEPTED", actor, text(body.get("remark")));
             }
             case "ARRIVE" -> {
                 requireStatus(status, "ACCEPTED", "PROCESSING");
                 assertAssignee(order, actor, "工单");
-                jdbcTemplate.update("UPDATE ops_work_order SET status='PROCESSING', arrived_time=COALESCE(arrived_time, NOW()), update_by=? WHERE id=?", actor.name(), id);
+                jdbcTemplate.update("UPDATE ops_work_order SET status='PROCESSING', arrived_time=COALESCE(arrived_time, NOW()), update_by=?, workflow_version=workflow_version+1 WHERE id=?", actor.name(), id);
                 log(id, "ARRIVE", status, "PROCESSING", actor, text(body.get("remark")));
+                markSourceAlarmProcessing(order, actor);
+            }
+            case "START" -> {
+                requireStatus(status, "ASSIGNED", "ACCEPTED", "PROCESSING");
+                assertAssignee(order, actor, "工单");
+                jdbcTemplate.update("UPDATE ops_work_order SET status='PROCESSING', accepted_time=COALESCE(accepted_time,NOW()), arrived_time=COALESCE(arrived_time,NOW()), update_by=?, workflow_version=workflow_version+1 WHERE id=?", actor.name(), id);
+                log(id, "START", status, "PROCESSING", actor, text(body.get("remark")));
+                markSourceAlarmProcessing(order, actor);
             }
             case "COMPLETE" -> {
                 requireStatus(status, "ACCEPTED", "PROCESSING");
                 assertAssignee(order, actor, "工单");
-                jdbcTemplate.update("UPDATE ops_work_order SET status='VERIFYING', completed_time=NOW(), cause_category=?, solution=?, evidence_urls=?, update_by=? WHERE id=?",
+                jdbcTemplate.update("UPDATE ops_work_order SET status='VERIFYING', completed_time=NOW(), cause_category=?, solution=?, evidence_urls=?, update_by=?, workflow_version=workflow_version+1 WHERE id=?",
                         text(body.get("causeCategory")), requiredText(body.get("solution"), "solution"), text(body.get("evidenceUrls")), actor.name(), id);
                 log(id, "COMPLETE", status, "VERIFYING", actor, text(body.get("remark")));
             }
@@ -341,14 +363,15 @@ public class OperationsService {
                 requireStatus(status, "VERIFYING");
                 String remark = requiredText(body.get("verifyRemark"), "verifyRemark");
                 assertSourceAlarmRecovered(order);
-                jdbcTemplate.update("UPDATE ops_work_order SET status='CLOSED', active_source_key=NULL, close_type='MANUAL_VERIFY', verified_time=NOW(), closed_time=NOW(), verify_remark=?, update_by=? WHERE id=?", remark, actor.name(), id);
+                jdbcTemplate.update("UPDATE ops_work_order SET status='CLOSED', active_source_key=NULL, close_type='MANUAL_VERIFY', verified_time=NOW(), closed_time=NOW(), verify_remark=?, update_by=?, workflow_version=workflow_version+1 WHERE id=?", remark, actor.name(), id);
                 log(id, "VERIFY", status, "CLOSED", actor, remark);
                 closeSourceAlarm(order, actor, remark);
+                closeSourceInspection(order, actor, remark);
                 energySavingVerificationService.verifyOnClosure(order, actor.name());
             }
             case "CANCEL" -> {
                 requireStatus(status, "PENDING", "ASSIGNED");
-                jdbcTemplate.update("UPDATE ops_work_order SET status='CANCELLED', active_source_key=NULL, close_type='MANUAL_CANCEL', closed_time=NOW(), verify_remark=?, update_by=? WHERE id=?", requiredText(body.get("remark"), "remark"), actor.name(), id);
+                jdbcTemplate.update("UPDATE ops_work_order SET status='CANCELLED', active_source_key=NULL, close_type='MANUAL_CANCEL', closed_time=NOW(), verify_remark=?, update_by=?, workflow_version=workflow_version+1 WHERE id=?", requiredText(body.get("remark"), "remark"), actor.name(), id);
                 log(id, "CANCEL", status, "CANCELLED", actor, text(body.get("remark")));
                 jdbcTemplate.update("UPDATE log_alarm SET work_order_id=NULL, update_by=? WHERE work_order_id=?", actor.name(), id);
                 reopenSourceAlarmAfterCancellation(order, actor, text(body.get("remark")));
@@ -654,7 +677,8 @@ public class OperationsService {
     private void assertSourceAlarmRecovered(Map<String, Object> order) {
         if (!"ALARM".equalsIgnoreCase(textOr(order.get("source_type"), "")) || order.get("source_id") == null) return;
         Map<String, Object> alarm = single("SELECT event_status,condition_status FROM log_alarm WHERE id=? FOR UPDATE", order.get("source_id"));
-        if (!"RECOVERED".equalsIgnoreCase(textOr(alarm.get("event_status"), ""))
+        String eventStatus = textOr(alarm.get("event_status"), "");
+        if (!("RECOVERED".equalsIgnoreCase(eventStatus) || "CLOSED".equalsIgnoreCase(eventStatus))
                 || !"CLEARED".equalsIgnoreCase(textOr(alarm.get("condition_status"), ""))) {
             throw new BusinessException("设备告警尚未恢复，不能验收关闭工单");
         }
@@ -688,11 +712,38 @@ public class OperationsService {
             throw new BusinessException("已恢复或已关闭的告警不能创建处置工单");
         }
         jdbcTemplate.update("""
-                UPDATE log_alarm SET event_status='IN_PROGRESS',
+                UPDATE log_alarm SET event_status='ACKNOWLEDGED',
                     ack_user_id=COALESCE(ack_user_id,?), ack_user=COALESCE(ack_user,?), ack_time=COALESCE(ack_time,NOW()),
-                    process_time=COALESCE(process_time,NOW()), deal_user=?, deal_remark=?, update_by=?, version=version+1 WHERE id=?
+                    deal_user=?, deal_remark=?, update_by=?, version=version+1 WHERE id=?
                 """, actor.userId(), actor.name(), actor.name(), remark, actor.name(), alarmId);
-        alarmLog(alarmId, "CREATE_WORK_ORDER", from, "IN_PROGRESS", actor, remark);
+        alarmLog(alarmId, "CREATE_WORK_ORDER", from, "ACKNOWLEDGED", actor, remark);
+    }
+
+    private void markSourceAlarmProcessing(Map<String, Object> order, Actor actor) {
+        if (!"ALARM".equalsIgnoreCase(textOr(order.get("source_type"), "")) || order.get("source_id") == null) return;
+        long alarmId = number(order.get("source_id"));
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(
+                "SELECT event_status,condition_status FROM log_alarm WHERE id=? FOR UPDATE", alarmId);
+        if (rows.isEmpty()) return;
+        String from = textOr(rows.get(0).get("event_status"), "ACKNOWLEDGED").toUpperCase();
+        if (!"ACTIVE".equalsIgnoreCase(textOr(rows.get(0).get("condition_status"), "ACTIVE"))
+                || List.of("RECOVERED", "CLOSED", "FALSE_POSITIVE").contains(from)) return;
+        if ("IN_PROGRESS".equals(from)) return;
+        jdbcTemplate.update("""
+                UPDATE log_alarm SET event_status='IN_PROGRESS', process_time=COALESCE(process_time,NOW()),
+                    deal_user=?, deal_remark=?, update_by=?, version=version+1 WHERE id=?
+                """, actor.name(), "关联工单开始处理", actor.name(), alarmId);
+        alarmLog(alarmId, "WORK_ORDER_STARTED", from, "IN_PROGRESS", actor,
+                "工单 " + order.get("work_order_no") + " 开始处理");
+    }
+
+    private void closeSourceInspection(Map<String, Object> order, Actor actor, String remark) {
+        if (!"INSPECTION".equalsIgnoreCase(textOr(order.get("source_type"), "")) || order.get("source_id") == null) return;
+        jdbcTemplate.update("""
+                UPDATE ops_inspection_task SET status='RESOLVED',
+                    result_remark=CONCAT(COALESCE(result_remark,''), ' [工单闭环] ', ?), update_by=?
+                WHERE id=? AND status='ABNORMAL'
+                """, remark, actor.name(), order.get("source_id"));
     }
 
     private void reopenSourceAlarmAfterCancellation(Map<String, Object> order, Actor actor, String remark) {

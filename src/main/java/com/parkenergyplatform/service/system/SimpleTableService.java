@@ -295,7 +295,59 @@ public class SimpleTableService {
         if ("spaces".equals(resource)) {
             jdbcTemplate.update("DELETE FROM billing_space_scope WHERE space_id = ?", id);
         }
+        if ("devices".equals(resource)) {
+            cascadeDeleteDevice(id);
+            return;
+        }
         jdbcTemplate.update("DELETE FROM " + definition.table() + " WHERE id = ?", id);
+    }
+
+    private void cascadeDeleteDevice(long deviceId) {
+        // Clear workflow children before deleting their parent records. The whole method
+        // participates in delete(...)'s transaction, so a failed cleanup rolls back all steps.
+        jdbcTemplate.update("""
+                DELETE FROM ops_energy_saving_verification
+                WHERE device_id = ? OR work_order_id IN (
+                    SELECT id FROM ops_work_order WHERE device_id = ?
+                )
+                """, deviceId, deviceId);
+        jdbcTemplate.update("DELETE FROM ops_inspection_task WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("""
+                DELETE FROM ops_work_order_log
+                WHERE work_order_id IN (SELECT id FROM ops_work_order WHERE device_id = ?)
+                """, deviceId);
+        jdbcTemplate.update("DELETE FROM ops_work_order WHERE device_id = ?", deviceId);
+
+        jdbcTemplate.update("""
+                DELETE FROM alarm_event_log
+                WHERE alarm_id IN (SELECT id FROM log_alarm WHERE device_id = ?)
+                """, deviceId);
+        jdbcTemplate.update("DELETE FROM log_alarm WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("DELETE FROM alarm_rule_version WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("DELETE FROM alarm_rule WHERE device_id = ?", deviceId);
+
+        jdbcTemplate.update("DELETE FROM command_record WHERE target_type = 'DEVICE' AND target_id = ?", deviceId);
+        jdbcTemplate.update("DELETE FROM billing_bill_detail WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("DELETE FROM billing_meter_change_order WHERE source_device_id = ? OR target_device_id = ?", deviceId, deviceId);
+        jdbcTemplate.update("DELETE FROM leasing_contract_meter WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("DELETE FROM energy_efficiency_baseline WHERE device_id = ?", deviceId);
+
+        jdbcTemplate.update("DELETE FROM stats_tou_daily WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("DELETE FROM stats_hourly_point WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("DELETE FROM stats_daily_point WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("DELETE FROM stats_collection_daily WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("DELETE FROM data_meter_reading_state WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("DELETE FROM data_ingest_item WHERE device_id = ?", deviceId);
+
+        jdbcTemplate.update("DELETE FROM dev_device_attribute_value WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("DELETE FROM dev_device_deployment_log WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("""
+                UPDATE access_discovered_device
+                SET bound_device_id = NULL, discovery_status = 'PENDING',
+                    fail_reason = NULL, update_time = NOW()
+                WHERE bound_device_id = ?
+                """, deviceId);
+        jdbcTemplate.update("DELETE FROM dev_device WHERE id = ?", deviceId);
     }
 
     private void assertCatalogResourceWritable(String resource, Long id, Map<String, Object> values) {
@@ -407,15 +459,7 @@ public class SimpleTableService {
                     throw new BusinessException("该网关下存在设备，请先删除设备");
                 }
             }
-            case "devices" -> {
-                if (count("SELECT COUNT(*) FROM log_alarm WHERE device_id = ?", id) > 0
-                        || count("SELECT COUNT(*) FROM command_record WHERE target_type = 'DEVICE' AND target_id = ?", id) > 0
-                        || count("SELECT COUNT(*) FROM ops_work_order WHERE device_id = ?", id) > 0
-                        || count("SELECT COUNT(*) FROM billing_bill_detail WHERE device_id = ?", id) > 0
-                        || count("SELECT COUNT(*) FROM billing_meter_change_order WHERE source_device_id = ? OR target_device_id = ?", id, id) > 0) {
-                    throw new BusinessException("设备已有告警、指令、工单、账单或计量变更记录，不能删除；请改为停用设备");
-                }
-            }
+            case "devices" -> { }
             case "spaces" -> {
                 if (count("SELECT COUNT(*) FROM park_space WHERE parent_id = ?", id) > 0
                         || count("SELECT COUNT(*) FROM dev_device WHERE space_id = ?", id) > 0

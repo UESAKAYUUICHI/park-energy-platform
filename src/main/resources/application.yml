@@ -1,9 +1,11 @@
 server:
-  port: 8103
+  port: 8203
 
 spring:
   application:
     name: park-energy-platform
+  config:
+    import: optional:file:./config/application-secrets.yml
   servlet:
     multipart:
       max-file-size: 5MB
@@ -43,18 +45,18 @@ park:
     automation-initial-delay-ms: ${PARK_ALARM_AUTOMATION_INITIAL_DELAY_MS:3000}
     default-recovery-hold-seconds: ${PARK_ALARM_RECOVERY_HOLD_SECONDS:8}
   platform:
-    data-base-url: http://localhost:8102
-    access-base-url: http://localhost:8101
+    data-base-url: http://localhost:8202
+    access-base-url: http://localhost:8201
     remote-connect-timeout-ms: ${REMOTE_SERVICE_CONNECT_TIMEOUT_MS:1000}
     remote-read-timeout-ms: ${REMOTE_SERVICE_READ_TIMEOUT_MS:3000}
   cos:
-    enabled: ${PARK_COS_ENABLED:false}
-    bucket: ${PARK_COS_BUCKET:iotserver-1460880192}
-    region: ${PARK_COS_REGION:ap-shanghai}
-    secret-id: ${PARK_COS_SECRET_ID:}
-    secret-key: ${PARK_COS_SECRET_KEY:}
-    object-prefix: ${PARK_COS_OBJECT_PREFIX:device-models/}
-    url-expire-seconds: ${PARK_COS_URL_EXPIRE_SECONDS:600}
+    enabled: false
+    bucket: ""
+    region: ap-shanghai
+    secret-id: ""
+    secret-key: ""
+    object-prefix: device-models/
+    url-expire-seconds: 600
 
 sa-token:
   token-name: Authorization

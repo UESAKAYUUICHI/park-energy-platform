@@ -30,3 +30,6 @@ build/
 
 ### VS Code ###
 .vscode/
+
+# Local/runtime credentials
+/config/application-secrets.yml
