@@ -12,6 +12,7 @@ import com.parkenergyplatform.common.ApiResponse;
 import com.parkenergyplatform.common.PageResult;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
@@ -101,6 +102,14 @@ public class OperationsController {
     @OperationLog(module = "设备运维", operation = "修改巡检计划")
     public ApiResponse<Map<String, Object>> updateInspectionPlan(@PathVariable long id, @RequestBody Map<String, Object> body) {
         return ApiResponse.success(operationsService.saveInspectionPlan(id, body));
+    }
+
+    @DeleteMapping("/inspection-plans/{id}")
+    @SaCheckPermission("ops:inspection:edit")
+    @OperationLog(module = "设备运维", operation = "删除巡检计划")
+    public ApiResponse<Void> deleteInspectionPlan(@PathVariable long id) {
+        operationsService.deleteInspectionPlan(id);
+        return ApiResponse.success(null);
     }
 
     @PostMapping("/inspection-tasks/generate")

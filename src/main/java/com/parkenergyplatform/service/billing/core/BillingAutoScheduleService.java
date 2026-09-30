@@ -99,6 +99,15 @@ public class BillingAutoScheduleService {
         }
         jdbc.update("DELETE FROM billing_auto_schedule_contract WHERE schedule_id=?", id);
         for (Long contractId : contractIds) jdbc.update("INSERT INTO billing_auto_schedule_contract (schedule_id,contract_id,created_by) VALUES (?,?,?)", id, contractId, operator);
+        LocalDateTime now = LocalDateTime.now(ZoneId.of("Asia/Shanghai"));
+        LocalDate nextDate = now.toLocalDate().withDayOfMonth(Math.min(day, now.toLocalDate().lengthOfMonth()));
+        LocalDateTime nextRun = nextDate.atTime(time.length() == 5 ? LocalTime.parse(time + ":00") : LocalTime.parse(time));
+        if (!nextRun.isAfter(now)) {
+            LocalDate nextMonth = now.toLocalDate().plusMonths(1);
+            nextRun = nextMonth.withDayOfMonth(Math.min(day, nextMonth.lengthOfMonth()))
+                    .atTime(time.length() == 5 ? LocalTime.parse(time + ":00") : LocalTime.parse(time));
+        }
+        jdbc.update("UPDATE billing_auto_schedule SET next_run_at=? WHERE id=?", nextRun, id);
         return required(id);
     }
 
@@ -248,7 +257,8 @@ public class BillingAutoScheduleService {
         String message = "自动出账失败：" + rootMessage(exception);
         if (message == null || message.isBlank()) message = exception.getClass().getSimpleName();
         if (message.length() > 500) message = message.substring(0, 500);
-        jdbc.update("UPDATE billing_auto_schedule SET last_run_at=NOW(),last_run_status='FAILED',last_run_batch_id=NULL,last_run_message=? WHERE id=?", message, id);
+        // 失败后保留失败状态，但将下一次尝试设置为短暂延迟，不能沿用原账期游标，否则同月失败后会一直等到下个月。
+        jdbc.update("UPDATE billing_auto_schedule SET last_run_at=NULL,last_run_status='FAILED',last_run_batch_id=NULL,last_run_message=?,next_run_at=DATE_ADD(NOW(), INTERVAL 5 MINUTE) WHERE id=?", message, id);
     }
 
     private String rootMessage(Throwable exception) {

@@ -452,7 +452,9 @@ public class PlatformBusinessQueryService {
     public Map<String, Object> gatewayArchiveProfile(long gatewayId) {
         accessService.assertGatewayAccess(gatewayId);
         Map<String, Object> gateway = single("""
-                SELECT g.*, o.org_name
+                SELECT g.id, g.gateway_sn, g.gateway_name, g.org_id, g.install_location,
+                       g.ip_address, g.heartbeat_interval, g.online_status, g.last_online_time,
+                       g.firmware_version, g.status, g.create_time, g.update_time, o.org_name
                 FROM dev_gateway g
                 LEFT JOIN dev_org o ON o.id = g.org_id
                 WHERE g.id = ?

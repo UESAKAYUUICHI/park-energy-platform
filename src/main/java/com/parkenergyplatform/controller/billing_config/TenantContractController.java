@@ -32,6 +32,8 @@ public class TenantContractController {
     public ApiResponse<Map<String,Object>> update(@PathVariable long id,@RequestBody Map<String,Object> body) { return ApiResponse.success(contractService.update(id,body)); }
     @PostMapping("/{id}/activate") @SaCheckPermission("billing:contract:edit") @OperationLog(module="园区经营",operation="生效租户合同")
     public ApiResponse<Map<String,Object>> activate(@PathVariable long id) { return ApiResponse.success(contractService.activate(id)); }
+    @PostMapping("/{id}/prepare-account") @SaCheckPermission("billing:contract:edit") @OperationLog(module="园区经营",operation="准备合同计费账户")
+    public ApiResponse<Map<String,Object>> prepareAccount(@PathVariable long id) { return ApiResponse.success(contractService.prepareBillingAccount(id)); }
     @PostMapping("/{id}/terminate") @SaCheckPermission("billing:contract:edit") @OperationLog(module="园区经营",operation="终止租户合同")
     public ApiResponse<Map<String,Object>> terminate(@PathVariable long id,@RequestBody Map<String,Object> body) { return ApiResponse.success(contractService.terminate(id,body)); }
     @PostMapping("/{id}/delete") @SaCheckPermission("billing:contract:edit") @OperationLog(module="园区经营",operation="删除已终止租户合同")

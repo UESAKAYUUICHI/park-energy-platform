@@ -289,6 +289,10 @@ public class SimpleTableService {
         TableDefinition definition = tableRegistry.get(resource);
         Map<String, Object> current = get(resource, id);
         assertCatalogResourceWritable(resource, id, current);
+        if ("gateways".equals(resource)) {
+            cascadeDeleteGateway(id);
+            return;
+        }
         assertDeleteChain(resource, id);
         // 计费空间的设备范围映射属于空间的业务子记录。数据库外键默认不级联，
         // 删除空间前必须先清理映射，否则会被 billing_space_scope 外键拦截并返回 500。
@@ -323,6 +327,7 @@ public class SimpleTableService {
                 WHERE alarm_id IN (SELECT id FROM log_alarm WHERE device_id = ?)
                 """, deviceId);
         jdbcTemplate.update("DELETE FROM log_alarm WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("DELETE FROM alarm_protocol_device WHERE device_id = ?", deviceId);
         jdbcTemplate.update("DELETE FROM alarm_rule_version WHERE device_id = ?", deviceId);
         jdbcTemplate.update("DELETE FROM alarm_rule WHERE device_id = ?", deviceId);
 
@@ -337,6 +342,8 @@ public class SimpleTableService {
         jdbcTemplate.update("DELETE FROM stats_daily_point WHERE device_id = ?", deviceId);
         jdbcTemplate.update("DELETE FROM stats_collection_daily WHERE device_id = ?", deviceId);
         jdbcTemplate.update("DELETE FROM data_meter_reading_state WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("DELETE FROM stats_collection_window_sample WHERE device_id = ?", deviceId);
+        jdbcTemplate.update("DELETE FROM stats_collection_window WHERE device_id = ?", deviceId);
         jdbcTemplate.update("DELETE FROM data_ingest_item WHERE device_id = ?", deviceId);
 
         jdbcTemplate.update("DELETE FROM dev_device_attribute_value WHERE device_id = ?", deviceId);
@@ -348,6 +355,27 @@ public class SimpleTableService {
                 WHERE bound_device_id = ?
                 """, deviceId);
         jdbcTemplate.update("DELETE FROM dev_device WHERE id = ?", deviceId);
+    }
+
+    private void cascadeDeleteGateway(long gatewayId) {
+        List<Long> deviceIds = jdbcTemplate.queryForList(
+                "SELECT id FROM dev_device WHERE gateway_id=? ORDER BY id", Long.class, gatewayId);
+        for (Long deviceId : deviceIds) cascadeDeleteDevice(deviceId);
+
+        jdbcTemplate.update("DELETE FROM ops_work_order_log WHERE work_order_id IN (SELECT id FROM ops_work_order WHERE gateway_id=?)", gatewayId);
+        jdbcTemplate.update("DELETE FROM ops_work_order WHERE gateway_id=?", gatewayId);
+        jdbcTemplate.update("DELETE FROM command_record WHERE gateway_id=? OR (target_type='GATEWAY' AND target_id=?)", gatewayId, gatewayId);
+        jdbcTemplate.update("DELETE FROM data_ingest_item WHERE gateway_id=?", gatewayId);
+        jdbcTemplate.update("DELETE FROM data_ingest_event WHERE gateway_id=?", gatewayId);
+        jdbcTemplate.update("DELETE FROM log_raw_message WHERE gateway_id=?", gatewayId);
+        jdbcTemplate.update("DELETE FROM access_discovered_device WHERE gateway_id=?", gatewayId);
+        jdbcTemplate.update("DELETE FROM dev_edge_config_audit WHERE gateway_id=?", gatewayId);
+        jdbcTemplate.update("DELETE FROM dev_gateway_config_resource WHERE gateway_id=?", gatewayId);
+        jdbcTemplate.update("DELETE FROM dev_gateway_config_release WHERE gateway_id=?", gatewayId);
+        jdbcTemplate.update("DELETE FROM dev_gateway_config_state WHERE gateway_id=?", gatewayId);
+        jdbcTemplate.update("DELETE FROM dev_gateway_port_inventory WHERE gateway_id=?", gatewayId);
+        jdbcTemplate.update("DELETE FROM dev_gateway_channel WHERE gateway_id=?", gatewayId);
+        jdbcTemplate.update("DELETE FROM dev_gateway WHERE id=?", gatewayId);
     }
 
     private void assertCatalogResourceWritable(String resource, Long id, Map<String, Object> values) {

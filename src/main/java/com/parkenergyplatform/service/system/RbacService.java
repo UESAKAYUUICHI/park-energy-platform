@@ -1,5 +1,6 @@
 package com.parkenergyplatform.service.system;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -31,12 +32,15 @@ import com.parkenergyplatform.mapper.SysRoleMapper;
 import com.parkenergyplatform.mapper.SysRolePermissionMapper;
 import com.parkenergyplatform.mapper.SysUserMapper;
 import com.parkenergyplatform.mapper.SysUserRoleMapper;
+import com.parkenergyplatform.service.integration.ObjectStorageService;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
+import org.springframework.web.multipart.MultipartFile;
+import java.util.UUID;
 
 @Service
 public class RbacService {
@@ -47,6 +51,7 @@ public class RbacService {
     private final SysRolePermissionMapper rolePermissionMapper;
     private final DataScopeService dataScopeService;
     private final JdbcTemplate jdbcTemplate;
+    private final ObjectStorageService objectStorage;
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     @Value("${park.security.local-admin-fallback-enabled:false}")
@@ -76,7 +81,7 @@ public class RbacService {
 
     public RbacService(SysUserMapper userMapper, SysRoleMapper roleMapper, SysPermissionMapper permissionMapper,
                        SysUserRoleMapper userRoleMapper, SysRolePermissionMapper rolePermissionMapper,
-                       DataScopeService dataScopeService, JdbcTemplate jdbcTemplate) {
+                       DataScopeService dataScopeService, JdbcTemplate jdbcTemplate, ObjectStorageService objectStorage) {
         this.userMapper = userMapper;
         this.roleMapper = roleMapper;
         this.permissionMapper = permissionMapper;
@@ -84,6 +89,7 @@ public class RbacService {
         this.rolePermissionMapper = rolePermissionMapper;
         this.dataScopeService = dataScopeService;
         this.jdbcTemplate = jdbcTemplate;
+        this.objectStorage = objectStorage;
     }
 
     public Map<String, Object> login(LoginRequest request) {
@@ -115,6 +121,7 @@ public class RbacService {
         user.setPassword(null);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("user", user);
+        result.put("avatarUrl", objectStorage.previewUrlOrNull(user.getAvatar()));
         result.put("roles", jdbcTemplate.queryForList("""
                 SELECT r.role_code, r.role_name FROM sys_user_role ur
                 JOIN sys_role r ON r.id=ur.role_id AND r.status=1 WHERE ur.user_id=? ORDER BY r.id
@@ -138,9 +145,44 @@ public class RbacService {
         user.setNickname(profileText(request.get("nickname"), "昵称", 50));
         user.setPhone(profileText(request.get("phone"), "手机号", 20));
         user.setEmail(profileText(request.get("email"), "邮箱", 100));
-        user.setAvatar(profileText(request.get("avatar"), "头像地址", 500));
         userMapper.updateById(user);
         return currentUser();
+    }
+
+    @Transactional
+    public Map<String, Object> uploadCurrentAvatar(MultipartFile file) {
+        if (file == null || file.isEmpty()) throw new BusinessException("请选择头像文件");
+        if (file.getSize() > 5 * 1024 * 1024) throw new BusinessException("头像文件不能超过 5MB");
+        String contentType = file.getContentType();
+        if (!Set.of("image/jpeg", "image/png", "image/webp", "image/gif").contains(contentType)) {
+            throw new BusinessException("头像仅支持 JPG、PNG、WebP 或 GIF");
+        }
+        SysUser user = requireUser(StpUtil.getLoginIdAsLong());
+        String suffix = contentType.substring(contentType.indexOf('/') + 1).replace("jpeg", "jpg");
+        String objectKey = objectStorage.objectPrefix() + "avatars/" + user.getId() + "/" + UUID.randomUUID() + "." + suffix;
+        try (var input = file.getInputStream()) {
+            objectStorage.put(objectKey, input, file.getSize(), contentType);
+        } catch (IOException exception) {
+            throw new BusinessException("头像上传失败");
+        }
+        String oldAvatar = user.getAvatar();
+        user.setAvatar(objectKey);
+        userMapper.updateById(user);
+        if (StringUtils.hasText(oldAvatar) && !oldAvatar.startsWith("http")) objectStorage.deleteQuietly(oldAvatar);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("avatar", objectKey);
+        result.put("avatarUrl", objectStorage.previewUrlOrNull(objectKey));
+        return result;
+    }
+
+    @Transactional
+    public Map<String, Object> clearCurrentAvatar() {
+        SysUser user = requireUser(StpUtil.getLoginIdAsLong());
+        String oldAvatar = user.getAvatar();
+        user.setAvatar(null);
+        userMapper.updateById(user);
+        if (StringUtils.hasText(oldAvatar) && !oldAvatar.startsWith("http")) objectStorage.deleteQuietly(oldAvatar);
+        return Map.of("avatar", "", "avatarUrl", "");
     }
 
     @Transactional
@@ -303,9 +345,20 @@ public class RbacService {
         return permissionMapper.selectById(id);
     }
 
+    @Transactional
     public void deleteUser(Long id) {
-        userMapper.deleteById(id);
+        requireUser(id);
+        if (Objects.equals(id, StpUtil.getLoginIdAsLong())) throw new BusinessException("不能删除当前登录账号");
+        Long ownedTenants = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM crm_tenant WHERE owner_user_id=?", Long.class, id);
+        if (ownedTenants != null && ownedTenants > 0) throw new BusinessException("该用户仍是租户负责人，请先转移租户归属后再删除");
+        jdbcTemplate.update("UPDATE ops_inspection_plan SET assignee_user_id=NULL, assignee_name=NULL WHERE assignee_user_id=?", id);
+        jdbcTemplate.update("UPDATE ops_inspection_task SET assignee_user_id=NULL, assignee_name=NULL WHERE assignee_user_id=?", id);
+        jdbcTemplate.update("UPDATE ops_work_order SET assignee_user_id=NULL, assignee_name=NULL WHERE assignee_user_id=?", id);
+        jdbcTemplate.update("DELETE FROM ops_on_call_shift WHERE user_id=?", id);
+        jdbcTemplate.update("DELETE FROM ops_notification WHERE receiver_user_id=?", id);
+        jdbcTemplate.update("DELETE FROM sys_user_org_scope WHERE user_id=?", id);
         userRoleMapper.delete(new LambdaQueryWrapper<SysUserRole>().eq(SysUserRole::getUserId, id));
+        userMapper.deleteById(id);
     }
 
     public void deleteRole(Long id) {

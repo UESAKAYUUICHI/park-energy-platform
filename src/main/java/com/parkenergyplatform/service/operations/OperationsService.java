@@ -437,6 +437,19 @@ public class OperationsService {
     }
 
     @Transactional
+    public void deleteInspectionPlan(long id) {
+        Map<String, Object> plan = single("SELECT * FROM ops_inspection_plan WHERE id=?", id);
+        assertOrg(number(plan.get("org_id")));
+        Long linkedTasks = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM ops_inspection_task WHERE plan_id=? AND work_order_id IS NOT NULL", Long.class, id);
+        if (linkedTasks != null && linkedTasks > 0) {
+            throw new BusinessException("该巡检计划已有工单关联，不能直接删除，请先处理关联工单");
+        }
+        jdbcTemplate.update("DELETE FROM ops_inspection_task WHERE plan_id=?", id);
+        jdbcTemplate.update("DELETE FROM ops_inspection_plan WHERE id=?", id);
+    }
+
+    @Transactional
     public Map<String, Object> executeInspection(long taskId, Map<String, Object> body) {
         List<Map<String, Object>> rows = jdbcTemplate.queryForList("SELECT * FROM ops_inspection_task WHERE id=? FOR UPDATE", taskId);
         if (rows.isEmpty()) throw new BusinessException(404, "巡检任务不存在");

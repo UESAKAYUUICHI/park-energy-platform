@@ -145,11 +145,22 @@ public class TenantContractService {
         if (spaces == 0 || meters == 0) throw new BusinessException("合同必须至少分配一个空间和一块结算表计");
         LocalDate start = ((Date) contract.get("start_date")).toLocalDate();
         LocalDate end = ((Date) contract.get("end_date")).toLocalDate();
-        if (count("SELECT COUNT(*) FROM leasing_contract_space x JOIN leasing_contract c ON c.id=x.contract_id JOIN leasing_contract_space mine ON mine.space_id=x.space_id WHERE mine.contract_id=? AND c.status='ACTIVE' AND x.rent_start_date <= ? AND (x.rent_end_date IS NULL OR x.rent_end_date >= ?)", id, Date.valueOf(end), Date.valueOf(start)) > 0)
-            throw new BusinessException("合同空间与已有生效合同重叠");
+        // 空间可以被多个合同引用，真正不能重复结算的是同一块计量表。
+        // 例如同一宿舍楼可以按楼层、租户或不同计量表拆分合同；只按空间拦截会阻止合法的分表结算。
         if (count("SELECT COUNT(*) FROM leasing_contract_meter x JOIN leasing_contract c ON c.id=x.contract_id JOIN leasing_contract_meter mine ON mine.device_id=x.device_id WHERE mine.contract_id=? AND c.status='ACTIVE' AND x.start_date <= ? AND (x.end_date IS NULL OR x.end_date >= ?)", id, Date.valueOf(end), Date.valueOf(start)) > 0)
             throw new BusinessException("结算表计已被其他生效合同占用");
         jdbcTemplate.update("UPDATE leasing_contract SET status='ACTIVE', signed_by=?, signed_time=NOW() WHERE id=?", "platform", id);
+        ensureBillingAccount(contract);
+        return detail(id);
+    }
+
+    @Transactional
+    public Map<String, Object> prepareBillingAccount(long id) {
+        Map<String, Object> contract = required(id);
+        assertAccess(contract);
+        String status = String.valueOf(contract.get("status"));
+        if (!"DRAFT".equalsIgnoreCase(status) && !"ACTIVE".equalsIgnoreCase(status))
+            throw new BusinessException("只有草稿或生效合同可以准备计费账户");
         ensureBillingAccount(contract);
         return detail(id);
     }
