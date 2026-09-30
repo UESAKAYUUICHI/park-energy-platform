@@ -15,6 +15,7 @@ import cn.dev33.satoken.stp.StpUtil;
 import cn.dev33.satoken.SaManager;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import org.springframework.dao.DuplicateKeyException;
 import com.parkenergyplatform.common.BusinessException;
 import com.parkenergyplatform.common.PageResult;
 import com.parkenergyplatform.dto.AssignIdsRequest;
@@ -342,6 +343,17 @@ public class RbacService {
 
         List<Long> added = relationIds(request.addedIds());
         List<Long> removed = relationIds(request.removedIds());
+        if (!added.isEmpty()) {
+            Set<Long> validPermissionIds = permissionMapper.selectBatchIds(added).stream()
+                    .map(SysPermission::getId)
+                    .collect(java.util.stream.Collectors.toSet());
+            List<Long> invalid = added.stream()
+                    .filter(permissionId -> !validPermissionIds.contains(permissionId))
+                    .toList();
+            if (!invalid.isEmpty()) {
+                throw new BusinessException(400, "存在无效权限，无法保存：" + invalid);
+            }
+        }
         if (!removed.isEmpty()) {
             rolePermissionMapper.delete(new LambdaQueryWrapper<SysRolePermission>()
                     .eq(SysRolePermission::getRoleId, roleId)
@@ -357,7 +369,11 @@ public class RbacService {
                 SysRolePermission relation = new SysRolePermission();
                 relation.setRoleId(roleId);
                 relation.setPermissionId(permissionId);
-                rolePermissionMapper.insert(relation);
+                try {
+                    rolePermissionMapper.insert(relation);
+                } catch (DuplicateKeyException ignored) {
+                    // 并发保存同一项权限时，另一请求可能已经完成写入；保持幂等即可。
+                }
             }
         }
     }

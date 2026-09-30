@@ -97,7 +97,7 @@ public class DataScopeService {
                 SELECT s.id, s.user_id, s.org_id, s.scope_mode, s.create_time,
                        o.org_name, o.parent_id, o.org_type
                 FROM sys_user_org_scope s
-                LEFT JOIN dev_org o ON o.id = s.org_id
+                JOIN dev_org o ON o.id = s.org_id
                 WHERE s.user_id = ?
                 ORDER BY s.id
                 """, userId);

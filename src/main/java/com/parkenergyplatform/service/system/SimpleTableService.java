@@ -316,6 +316,10 @@ public class SimpleTableService {
             return;
         }
         assertDeleteChain(resource, id);
+        // 组织删除后不能遗留用户组织范围，否则个人中心会展示已失效的组织记录。
+        if ("orgs".equals(resource)) {
+            jdbcTemplate.update("DELETE FROM sys_user_org_scope WHERE org_id = ?", id);
+        }
         // 计费空间的设备范围映射属于空间的业务子记录。数据库外键默认不级联，
         // 删除空间前必须先清理映射，否则会被 billing_space_scope 外键拦截并返回 500。
         if ("spaces".equals(resource)) {
