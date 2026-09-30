@@ -18,6 +18,7 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.parkenergyplatform.common.BusinessException;
 import com.parkenergyplatform.common.PageResult;
 import com.parkenergyplatform.dto.AssignIdsRequest;
+import com.parkenergyplatform.dto.AssignIdsDeltaRequest;
 import com.parkenergyplatform.dto.AssignUserOrgScopesRequest;
 import com.parkenergyplatform.dto.LoginRequest;
 import com.parkenergyplatform.dto.PasswordRequest;
@@ -271,8 +272,17 @@ public class RbacService {
     @Transactional
     public void assignRoles(Long userId, AssignIdsRequest request) {
         requireUser(userId);
-        userRoleMapper.delete(new LambdaQueryWrapper<SysUserRole>().eq(SysUserRole::getUserId, userId));
-        for (Long roleId : ids(request)) {
+        List<Long> desired = ids(request);
+        List<Long> current = userRoleMapper.selectList(new LambdaQueryWrapper<SysUserRole>()
+                .eq(SysUserRole::getUserId, userId)).stream().map(SysUserRole::getRoleId).toList();
+        List<Long> removed = current.stream().filter(roleId -> !desired.contains(roleId)).toList();
+        List<Long> added = desired.stream().filter(roleId -> !current.contains(roleId)).toList();
+        if (!removed.isEmpty()) {
+            userRoleMapper.delete(new LambdaQueryWrapper<SysUserRole>()
+                    .eq(SysUserRole::getUserId, userId)
+                    .in(SysUserRole::getRoleId, removed));
+        }
+        for (Long roleId : added) {
             SysUserRole relation = new SysUserRole();
             relation.setUserId(userId);
             relation.setRoleId(roleId);
@@ -316,6 +326,39 @@ public class RbacService {
             relation.setRoleId(roleId);
             relation.setPermissionId(permissionId);
             rolePermissionMapper.insert(relation);
+        }
+    }
+
+    /**
+     * Applies only changed role-permission rows. This keeps a single checkbox
+     * change from rewriting the whole permission set.
+     */
+    @Transactional
+    public void assignPermissionDelta(Long roleId, AssignIdsDeltaRequest request) {
+        if (roleMapper.selectById(roleId) == null) {
+            throw new BusinessException(404, "角色不存在");
+        }
+        if (request == null) return;
+
+        List<Long> added = relationIds(request.addedIds());
+        List<Long> removed = relationIds(request.removedIds());
+        if (!removed.isEmpty()) {
+            rolePermissionMapper.delete(new LambdaQueryWrapper<SysRolePermission>()
+                    .eq(SysRolePermission::getRoleId, roleId)
+                    .in(SysRolePermission::getPermissionId, removed));
+        }
+        if (!added.isEmpty()) {
+            Set<Long> existing = rolePermissionMapper.selectList(new LambdaQueryWrapper<SysRolePermission>()
+                    .eq(SysRolePermission::getRoleId, roleId)
+                    .in(SysRolePermission::getPermissionId, added))
+                    .stream().map(SysRolePermission::getPermissionId).collect(java.util.stream.Collectors.toSet());
+            for (Long permissionId : added) {
+                if (existing.contains(permissionId)) continue;
+                SysRolePermission relation = new SysRolePermission();
+                relation.setRoleId(roleId);
+                relation.setPermissionId(permissionId);
+                rolePermissionMapper.insert(relation);
+            }
         }
     }
 
@@ -492,6 +535,11 @@ public class RbacService {
             return Collections.emptyList();
         }
         return request.ids().stream().filter(Objects::nonNull).distinct().toList();
+    }
+
+    private List<Long> relationIds(List<Long> values) {
+        return values == null ? Collections.emptyList() : values.stream()
+                .filter(Objects::nonNull).distinct().toList();
     }
 
     private boolean passwordMatches(String raw, String encoded) {

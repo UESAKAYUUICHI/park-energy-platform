@@ -40,6 +40,23 @@ public class AccessProxyController {
         return ApiResponse.success(filterRemoteList(remoteServiceClient.getAccess("/api/access/gateways/status"), "gateway"));
     }
 
+    @GetMapping("/overview")
+    @SaCheckPermission("access:view")
+    public ApiResponse<Map<String, Object>> overview() {
+        Map<String, Object> response = remoteServiceClient.getAccess("/api/access/monitoring/overview");
+        Object data = response.get("data");
+        if (!(data instanceof Map<?, ?> source)) {
+            return ApiResponse.success(response);
+        }
+        Map<String, Object> filtered = new LinkedHashMap<>(response);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("gateways", filterRows(source.get("gateways"), "gateway"));
+        result.put("raw", filterRows(source.get("raw"), "gateway"));
+        result.put("discovered", filterRows(source.get("discovered"), "gateway"));
+        filtered.put("data", result);
+        return ApiResponse.success(filtered);
+    }
+
     @GetMapping("/raw-messages")
     @SaCheckPermission("access:view")
     public ApiResponse<Map<String, Object>> rawMessages() {
@@ -142,6 +159,16 @@ public class AccessProxyController {
             filtered.put("data", accessService.filterByGatewayAccess(rows));
         }
         return filtered;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> filterRows(Object value, String mode) {
+        if (!(value instanceof List<?> list)) return List.of();
+        List<Map<String, Object>> rows = list.stream()
+                .filter(Map.class::isInstance)
+                .map(row -> (Map<String, Object>) row)
+                .toList();
+        return "command".equals(mode) ? accessService.filterCommands(rows) : accessService.filterByGatewayAccess(rows);
     }
 
     @SuppressWarnings("unchecked")

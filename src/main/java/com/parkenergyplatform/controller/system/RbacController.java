@@ -9,6 +9,7 @@ import com.parkenergyplatform.aop.OperationLog;
 import com.parkenergyplatform.common.ApiResponse;
 import com.parkenergyplatform.common.PageResult;
 import com.parkenergyplatform.dto.AssignIdsRequest;
+import com.parkenergyplatform.dto.AssignIdsDeltaRequest;
 import com.parkenergyplatform.dto.AssignUserOrgScopesRequest;
 import com.parkenergyplatform.dto.PasswordRequest;
 import com.parkenergyplatform.entity.SysPermission;
@@ -135,6 +136,15 @@ public class RbacController {
     @OperationLog(module = "权限管理", operation = "分配角色权限")
     public ApiResponse<Void> assignPermissions(@PathVariable Long id, @RequestBody AssignIdsRequest request) {
         rbacService.assignPermissions(id, request);
+        return ApiResponse.success(null);
+    }
+
+    @PostMapping("/roles/{id}/permissions/delta")
+    @SaCheckPermission("system:role:edit")
+    @OperationLog(module = "权限管理", operation = "增量分配角色权限")
+    public ApiResponse<Void> assignPermissionDelta(@PathVariable Long id,
+                                                    @RequestBody AssignIdsDeltaRequest request) {
+        rbacService.assignPermissionDelta(id, request);
         return ApiResponse.success(null);
     }
 
