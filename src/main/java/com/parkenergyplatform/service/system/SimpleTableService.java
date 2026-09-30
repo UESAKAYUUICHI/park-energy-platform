@@ -143,7 +143,29 @@ public class SimpleTableService {
         if ("billing-rules".equals(resource) && key != null) {
             replaceBillingRuleConfigs(key.longValue(), body);
         }
+        if ("orgs".equals(resource) && key != null && StpUtil.isLogin()) {
+            grantCreatorOrgScope(key.longValue());
+        }
+        // 组织没有自身的 org_id 数据范围字段。新增后直接返回已写入的字段，避免
+        // 用通用数据范围查询回读时把刚创建的组织误判为不存在。
+        if ("orgs".equals(resource) && key != null) {
+            Map<String, Object> created = new LinkedHashMap<>(values);
+            created.put("id", key.longValue());
+            return created;
+        }
         return key == null ? values : get(resource, key.longValue());
+    }
+
+    private void grantCreatorOrgScope(long orgId) {
+        long userId = StpUtil.getLoginIdAsLong();
+        int updated = jdbcTemplate.update(
+                "UPDATE sys_user_org_scope SET scope_mode='SUBTREE' WHERE user_id=? AND org_id=?",
+                userId, orgId);
+        if (updated == 0) {
+            jdbcTemplate.update(
+                    "INSERT INTO sys_user_org_scope (user_id, org_id, scope_mode) VALUES (?, ?, 'SUBTREE')",
+                    userId, orgId);
+        }
     }
 
     @Transactional

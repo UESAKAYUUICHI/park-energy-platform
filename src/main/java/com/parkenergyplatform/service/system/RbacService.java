@@ -462,6 +462,13 @@ public class RbacService {
         data.put("tokenValue", StpUtil.getTokenValue());
         data.put("user", user);
         data.put("roles", roleCodes(user.getId()));
+        data.put("roleDetails", jdbcTemplate.queryForList("""
+                SELECT r.role_code, r.role_name
+                FROM sys_user_role ur
+                JOIN sys_role r ON r.id = ur.role_id AND r.status = 1
+                WHERE ur.user_id = ?
+                ORDER BY r.id
+                """, user.getId()));
         data.put("permissions", permissionCodes(user.getId()));
         data.put("orgScopes", dataScopeService.userOrgScopes(user.getId()));
         data.put("menus", menuTree());
