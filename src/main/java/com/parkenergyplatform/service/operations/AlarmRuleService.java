@@ -20,7 +20,7 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class AlarmRuleService {
     private static final List<String> MODES = List.of(
-            "THRESHOLD", "N_OF_M", "WINDOW_AVG", "RATE_OF_CHANGE", "MISSING_DATA", "OFFLINE");
+            "THRESHOLD", "N_OF_M", "WINDOW_AVG", "RATE_OF_CHANGE", "MISSING_DATA", "OFFLINE", "SCENE_IFOREST", "QUALITY_GATE");
     private final JdbcTemplate jdbcTemplate;
     private final BusinessDataAccessService accessService;
 

@@ -20,10 +20,14 @@ import org.springframework.transaction.annotation.Transactional;
 public class AlarmService {
     private final JdbcTemplate jdbcTemplate;
     private final BusinessDataAccessService accessService;
+    private final AiSceneDiagnosisService aiSceneDiagnosisService;
 
-    public AlarmService(JdbcTemplate jdbcTemplate, BusinessDataAccessService accessService) {
+    public AlarmService(JdbcTemplate jdbcTemplate,
+                        BusinessDataAccessService accessService,
+                        AiSceneDiagnosisService aiSceneDiagnosisService) {
         this.jdbcTemplate = jdbcTemplate;
         this.accessService = accessService;
+        this.aiSceneDiagnosisService = aiSceneDiagnosisService;
     }
 
     public Map<String, Object> detail(long alarmId) {
@@ -76,6 +80,13 @@ public class AlarmService {
                 "realtime", "/monitor/realtime?deviceId=" + data.get("device_id") + "&pointCode=" + Objects.toString(data.get("point_code"), ""),
                 "history", "/analysis/history?deviceId=" + data.get("device_id") + "&pointCode=" + Objects.toString(data.get("point_code"), ""),
                 "commands", "/access/commands?targetId=" + data.get("device_id")));
+        String alarmVal = Objects.toString(data.get("alarm_value"), "");
+        String pointCode = Objects.toString(data.get("point_code"), "");
+        boolean isCommIssue = alarmVal.contains("RS485") || alarmVal.contains("采集失败") || alarmVal.contains("OFFLINE") || pointCode.contains("状态");
+        data.put("sceneDiagnosis", aiSceneDiagnosisService.evaluateCustom(Map.of(
+                "eventId", isCommIssue ? "E-003" : "E-001",
+                "qualityMode", isCommIssue ? "MISSING_GAP" : "COMPLETE"
+        )));
         return data;
     }
 

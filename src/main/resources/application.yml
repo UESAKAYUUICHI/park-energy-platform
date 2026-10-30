@@ -57,6 +57,10 @@ park:
     secret-key: ""
     object-prefix: device-models/
     url-expire-seconds: 600
+  ai:
+    api-url: ${PARK_AI_API_URL:https://api.siliconflow.cn/v1/chat/completions}
+    api-key: ${PARK_AI_API_KEY:}
+    default-model: ${PARK_AI_DEFAULT_MODEL:Qwen/Qwen2.5-7B-Instruct}
 
 sa-token:
   token-name: Authorization

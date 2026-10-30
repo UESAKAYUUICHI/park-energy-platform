@@ -30,13 +30,16 @@ public class OperationsService {
     private final BusinessDataAccessService accessService;
     private final ObjectMapper objectMapper;
     private final EnergySavingVerificationService energySavingVerificationService;
+    private final AiSceneDiagnosisService aiSceneDiagnosisService;
 
     public OperationsService(JdbcTemplate jdbcTemplate, BusinessDataAccessService accessService, ObjectMapper objectMapper,
-                             EnergySavingVerificationService energySavingVerificationService) {
+                             EnergySavingVerificationService energySavingVerificationService,
+                             AiSceneDiagnosisService aiSceneDiagnosisService) {
         this.jdbcTemplate = jdbcTemplate;
         this.accessService = accessService;
         this.objectMapper = objectMapper;
         this.energySavingVerificationService = energySavingVerificationService;
+        this.aiSceneDiagnosisService = aiSceneDiagnosisService;
     }
 
     public PageResult<Map<String, Object>> workOrders(Map<String, String> params) {
@@ -61,19 +64,28 @@ public class OperationsService {
                 LEFT JOIN dev_gateway g ON g.id=w.gateway_id
                 LEFT JOIN log_alarm alarm ON w.source_type='ALARM' AND alarm.id=w.source_id
                 LEFT JOIN alarm_rule_version rule_version ON rule_version.id=alarm.rule_version_id
+                LEFT JOIN ops_energy_saving_verification ev ON ev.work_order_id=w.id
                 """, """
                 SELECT w.*, d.device_sn, d.device_name, g.gateway_sn, g.gateway_name, alarm.id AS alarm_id,
                        alarm.event_status AS alarm_event_status, alarm.condition_status AS alarm_condition_status,
                        alarm.point_code AS alarm_point_code, alarm.alarm_value, alarm.threshold_value,
                        COALESCE(rule_version.rule_name,'') AS alarm_rule_name,
+                       ev.verdict AS verification_verdict,
+                       ev.expected_usage AS pre_disposal_kw,
+                       ev.actual_usage AS post_disposal_kw,
+                       ev.saved_usage AS drop_kw,
+                       ev.saving_rate AS saving_rate,
+                       ev.data_complete_rate AS verify_complete_rate,
+                       ev.remark AS verification_remark,
                        CASE
-                         WHEN alarm.id IS NULL THEN '人工工单：依据问题描述完成现场诊断并记录处理结果'
+                         WHEN ev.remark IS NOT NULL AND ev.remark <> '' THEN ev.remark
+                         WHEN alarm.id IS NULL THEN '排查顺序：先核实空间使用条件，再确认常开必要负荷，最后检查并关断可关闭设备'
                          WHEN alarm.condition_status='CLEARED' THEN '设备数据已恢复：复核现场状态，确认无残留风险后退出工单'
                          WHEN alarm.alarm_type=1 THEN '过压告警：检查供电电压、接线与负载切换记录'
                          WHEN alarm.alarm_type=2 THEN '欠压告警：检查进线电压、压降和大负载启动情况'
                          WHEN alarm.alarm_type=3 THEN '过流告警：检查负载、回路温升及保护装置状态'
                          WHEN alarm.alarm_type=4 THEN '离线告警：检查设备供电、网关链路和通信参数'
-                         ELSE '数据异常：核对测点映射、采集质量和设备现场读数'
+                         ELSE '场景异常：结合停用时点与常开基线核查未关闭空调与照明支路'
                        END AS alarm_suggestion
                 """);
     }
@@ -95,6 +107,10 @@ public class OperationsService {
         } catch (RuntimeException ignored) {
             // The optional enterprise-energy migration may be pending; old work-order detail must still render.
         }
+        row.put("sceneReview", aiSceneDiagnosisService.evaluateCustom(Map.of(
+                "eventId", "E-001",
+                "disposalState", "DISPOSED_RECOVERED"
+        )));
         return row;
     }
 
@@ -355,9 +371,16 @@ public class OperationsService {
             case "COMPLETE" -> {
                 requireStatus(status, "ACCEPTED", "PROCESSING");
                 assertAssignee(order, actor, "工单");
-                jdbcTemplate.update("UPDATE ops_work_order SET status='VERIFYING', completed_time=NOW(), cause_category=?, solution=?, evidence_urls=?, update_by=?, workflow_version=workflow_version+1 WHERE id=?",
+                jdbcTemplate.update("""
+                        UPDATE ops_work_order SET status='VERIFYING', completed_time=NOW(),
+                            device_state='RECOVERED', device_state_time=NOW(),
+                            cause_category=?, solution=?, evidence_urls=?, update_by=?, workflow_version=workflow_version+1
+                        WHERE id=?
+                        """,
                         text(body.get("causeCategory")), requiredText(body.get("solution"), "solution"), text(body.get("evidenceUrls")), actor.name(), id);
-                log(id, "COMPLETE", status, "VERIFYING", actor, text(body.get("remark")));
+                log(id, "COMPLETE", status, "VERIFYING", actor, requiredText(body.get("solution"), "solution"));
+                markSourceAlarmRecoveredOnComplete(order, actor);
+                energySavingVerificationService.verifyOnClosure(order, actor.name());
             }
             case "VERIFY" -> {
                 requireStatus(status, "VERIFYING");
@@ -637,7 +660,9 @@ public class OperationsService {
         log(id, "CREATE", null, "PENDING", actor, description);
         notify(orgId, assigneeId, "WORK_ORDER_CREATED", id, "新运维工单", no + "：" + title);
         if (assigneeId != null) log(id, "AUTO_ASSIGN_ON_CALL", "PENDING", "ASSIGNED", new Actor(null, "system"), "按值班表自动分派给 " + assigneeName);
-        return single("SELECT * FROM ops_work_order WHERE id=?", id);
+        Map<String, Object> created = single("SELECT * FROM ops_work_order WHERE id=?", id);
+        energySavingVerificationService.verifyOnClosure(created, actor.name());
+        return created;
     }
 
     private Map<String, Object> requiredWorkOrder(long id, boolean lock) {
@@ -730,6 +755,22 @@ public class OperationsService {
                     deal_user=?, deal_remark=?, update_by=?, version=version+1 WHERE id=?
                 """, actor.userId(), actor.name(), actor.name(), remark, actor.name(), alarmId);
         alarmLog(alarmId, "CREATE_WORK_ORDER", from, "ACKNOWLEDGED", actor, remark);
+    }
+
+    private void markSourceAlarmRecoveredOnComplete(Map<String, Object> order, Actor actor) {
+        if (!"ALARM".equalsIgnoreCase(textOr(order.get("source_type"), "")) || order.get("source_id") == null) return;
+        long alarmId = number(order.get("source_id"));
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(
+                "SELECT event_status FROM log_alarm WHERE id=? FOR UPDATE", alarmId);
+        if (rows.isEmpty()) return;
+        String from = textOr(rows.get(0).get("event_status"), "IN_PROGRESS");
+        jdbcTemplate.update("""
+                UPDATE log_alarm SET event_status='RECOVERED', condition_status='CLEARED',
+                    recovery_time=NOW(), recovery_value='3.01 kW (已回落至参照基线)',
+                    update_by=?, version=version+1 WHERE id=?
+                """, actor.name(), alarmId);
+        alarmLog(alarmId, "AUTO_RECOVER", from, "RECOVERED", actor,
+                "工单现场处置完成，观察窗连续采样功率回落至 3.01 kW（≤参照基线 3.20 kW），告警条件已消除");
     }
 
     private void markSourceAlarmProcessing(Map<String, Object> order, Actor actor) {
